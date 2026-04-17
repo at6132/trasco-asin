@@ -1,4 +1,5 @@
 # Railway: set this folder as the service root for trasco-web (Next.js).
+# If the build still uses Node 18, set variable NIXPACKS_NODE_VERSION=20 on the service.
 
 [build]
 builder = "NIXPACKS"

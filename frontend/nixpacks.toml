@@ -1,0 +1,5 @@
+# Pin Node for Next.js 16 (requires >=20.9). Nixpacks defaults to 18 otherwise.
+# See https://nixpacks.com/docs/providers/node
+
+[variables]
+NIXPACKS_NODE_VERSION = "20"

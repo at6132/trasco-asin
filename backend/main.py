@@ -97,21 +97,46 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Trasco ASIN API", version="0.2.0", lifespan=lifespan)
 
 
+def _normalize_cors_origin(origin: str) -> Optional[str]:
+    """
+    Return a single origin string (scheme + host + optional port, no path/query).
+    Local dev may use http://localhost / 127.0.0.1; production should use https://.
+    """
+    u = (origin or "").strip().rstrip("/")
+    if not u or u == "*":
+        return None
+    if "://" not in u:
+        u = "https://" + u
+    low = u.lower()
+    if low.startswith(("http://localhost", "http://127.0.0.1")):
+        return u
+    if low.startswith("https://"):
+        return u
+    logger.warning("CORS origin rejected (use https in production): %s", origin[:80])
+    return None
+
+
 def _cors_allow_origins() -> list[str]:
     raw = (settings.cors_allow_origins or "").strip()
+    out: list[str] = []
     if raw:
-        parts = [x.strip() for x in raw.split(",") if x.strip()]
-        if parts:
-            return parts
+        for chunk in raw.split(","):
+            norm = _normalize_cors_origin(chunk)
+            if norm and norm not in out:
+                out.append(norm)
+    if out:
+        return out
     return ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allow_origins(),
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    # Origins are the main guard; keep headers permissive so multipart / fetch preflights succeed.
     allow_headers=["*"],
+    max_age=600,
 )
 
 

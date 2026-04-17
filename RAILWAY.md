@@ -73,7 +73,7 @@ Repo root includes `railway.toml` and `Procfile` for the API; `frontend/railway.
    | `KEEPA_API_KEY` | Required for `/api/v1/process`. |
    | `ANTHROPIC_API_KEY` | Required for Haiku-based header / column mapping when Ollama is not used. |
    | `HAIKU_MODEL` | Optional; default in code is `claude-3-5-haiku-20241022`. Set to your Haiku model id (e.g. newer Haiku 4.5 id from Anthropic docs). |
-   | `CORS_ALLOW_ORIGINS` | **Required** for the browser UI: your frontend public URL, e.g. `https://<frontend-service>.up.railway.app`. Comma-separate if you have several. |
+   | `CORS_ALLOW_ORIGINS` | **Required** for the browser UI: comma-separated origins (no path), e.g. `https://trasco-web-production.up.railway.app`. Non-local hosts must use `https://`. Trailing slashes are stripped. If unset, only `localhost` / `127.0.0.1` dev origins are allowed. |
    | `USE_OLLAMA_ASIN_VALIDATE` | Set `false` if you do not run Ollama in production. |
    | `USE_OLLAMA_RESOLVER_GEMMA` | Set `false` without Ollama. |
    | `USE_OLLAMA_SHEET_DOMAIN` | Set `false` without Ollama (uses `KEEPA_DOMAIN` only). |
@@ -104,6 +104,7 @@ Repo root includes `railway.toml` and `Procfile` for the API; `frontend/railway.
    | Variable | Notes |
    |----------|--------|
    | `NEXT_PUBLIC_API_BASE` | Full backend URL, **no trailing slash**, e.g. `https://trasco-api-production-xxxx.up.railway.app`. Must be set **before** `npm run build` so it is inlined into the client bundle. After changing it, **redeploy** the frontend. |
+   | `NIXPACKS_NODE_VERSION` | Set to **`20`** if the builder still picks Node 18 (Next 16 needs **≥ 20.9**). The repo also ships `frontend/.nvmrc`, `frontend/.node-version`, `frontend/nixpacks.toml`, and `package.json` `engines.node` to prefer Node 20. |
 
 6. Set **`CORS_ALLOW_ORIGINS`** on the **backend** to this frontend’s public URL.
 
