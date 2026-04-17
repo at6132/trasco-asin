@@ -90,6 +90,8 @@ export default function HomeClient() {
   const [processProgress, setProcessProgress] = useState<ProcessStatus | null>(null);
   const [completionSummary, setCompletionSummary] = useState<CompletionSummary | null>(null);
   const [historyRefreshTick, setHistoryRefreshTick] = useState(0);
+  /** Bumps after a successful run so the file picker remounts with an empty selection. */
+  const [runConsoleKey, setRunConsoleKey] = useState(0);
   const cancelledRef = useRef(false);
 
   useEffect(() => {
@@ -184,6 +186,7 @@ export default function HomeClient() {
               ollamaCompletionTokens: Number(s.ollama_completion_tokens) || 0,
               ollamaRequests: Number(s.ollama_requests) || 0,
             });
+            setRunConsoleKey((k) => k + 1);
             setHistoryRefreshTick((n) => n + 1);
             return;
           }
@@ -249,6 +252,7 @@ export default function HomeClient() {
             <h2 className="sr-only">Run</h2>
 
             <RunConsole
+              key={runConsoleKey}
               disabled={busy !== null}
               busy={busy === "process"}
               onRun={onProcess}
@@ -293,6 +297,14 @@ function RunConsole(props: {
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [fileInputReady, setFileInputReady] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const clearFile = useCallback(() => {
+    setFile(null);
+    const el = fileInputRef.current;
+    if (el) el.value = "";
+  }, []);
+
   useEffect(() => {
     setFileInputReady(true);
   }, []);
@@ -300,24 +312,37 @@ function RunConsole(props: {
   return (
     <div className="flex flex-col gap-6">
       {fileInputReady ? (
-        <label className="group relative block cursor-pointer">
-          <input
-            type="file"
-            accept={FILE_ACCEPT}
-            disabled={props.disabled}
-            className="sr-only"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          />
-          <div className="relative overflow-hidden rounded-2xl border-2 border-dashed border-cyan-500/35 bg-slate-900/50 px-6 py-14 text-center transition group-hover:border-cyan-400/60 group-hover:bg-slate-900/70 md:py-16">
-            <div className="trasco-shimmer-bar pointer-events-none absolute inset-0 overflow-hidden rounded-2xl" />
-            <div className="relative mx-auto max-w-md">
-              <p className="text-lg font-medium text-white">
-                {file ? file.name : "Drop a file or click to choose"}
-              </p>
-              <p className="mt-1 text-sm text-zinc-500">Excel or CSV</p>
+        <div className="relative">
+          <label className="group relative block cursor-pointer">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={FILE_ACCEPT}
+              disabled={props.disabled}
+              className="sr-only"
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            />
+            <div className="relative overflow-hidden rounded-2xl border-2 border-dashed border-cyan-500/35 bg-slate-900/50 px-6 py-14 text-center transition group-hover:border-cyan-400/60 group-hover:bg-slate-900/70 md:py-16">
+              <div className="trasco-shimmer-bar pointer-events-none absolute inset-0 overflow-hidden rounded-2xl" />
+              <div className="relative mx-auto max-w-md">
+                <p className="text-lg font-medium text-white">
+                  {file ? file.name : "Drop a file or click to choose"}
+                </p>
+                <p className="mt-1 text-sm text-zinc-500">Excel or CSV</p>
+              </div>
             </div>
-          </div>
-        </label>
+          </label>
+          {file && !props.disabled ? (
+            <button
+              type="button"
+              onClick={clearFile}
+              className="absolute right-3 top-3 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-slate-900/90 text-lg font-light leading-none text-zinc-300 shadow-lg backdrop-blur-sm transition hover:border-red-400/50 hover:bg-red-950/50 hover:text-red-200"
+              aria-label="Clear selected file"
+            >
+              ×
+            </button>
+          ) : null}
+        </div>
       ) : (
         <div
           className="h-40 rounded-2xl border border-dashed border-white/10 bg-slate-900/30"
