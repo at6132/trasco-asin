@@ -1,0 +1,414 @@
+"""
+Post-resolution check: Ollama (Gemma) decides if a Keepa listing matches the sheet line.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from collections import defaultdict
+from typing import Any, Callable, Literal, Optional
+
+import httpx
+
+from backend.ollama_usage import OllamaTokenLedger, record_chat_response
+
+logger = logging.getLogger(__name__)
+
+# Keepa marketplace ids (see https://keepa.com/#!api)
+ALLOWED_KEEPA_DOMAINS: frozenset[int] = frozenset({1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12})
+
+Verdict = Literal["accept", "reject", "error"]
+
+
+def ollama_tags_reachable(base_url: str, timeout: float = 3.0) -> bool:
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.get(base_url.rstrip("/") + "/api/tags")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _parse_json_from_content(content: str) -> dict[str, Any]:
+    text = (content or "").strip()
+    if not text:
+        return {}
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        out = json.loads(text)
+        return out if isinstance(out, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            out = json.loads(text[start : end + 1])
+            return out if isinstance(out, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _source_file_prompt_fragment(source_file_hint: Optional[str]) -> str:
+    s = (source_file_hint or "").strip()[:240]
+    if not s:
+        return ""
+    return (
+        "\nSpreadsheet upload filename (no extension) — often reflects the vendor or catalog; "
+        "use as a weak hint for brand or product family when the row text is short or ambiguous:\n"
+        f"upload_filename_hint: {s}\n"
+    )
+
+
+def ollama_validate_asin_vs_description(
+    base_url: str,
+    model: str,
+    *,
+    sheet_description: str,
+    distributor_sku: Optional[str],
+    asin: str,
+    amazon_title: Optional[str],
+    amazon_brand: Optional[str],
+    source_file_hint: Optional[str] = None,
+    ollama_usage: Optional[OllamaTokenLedger] = None,
+    timeout: float = 120.0,
+) -> tuple[Verdict, str]:
+    """
+    Ask Gemma whether the Amazon ASIN is the same product as the distributor line.
+
+    Returns (verdict, note). ``reject`` only when the model explicitly answers not a match.
+    """
+    desc = (sheet_description or "").strip()[:800]
+    if not desc:
+        return "error", "empty_sheet_description"
+
+    at = (amazon_title or "").strip()[:500] or "(no title from Keepa)"
+    ab = (amazon_brand or "").strip()[:120] or "(unknown brand)"
+    sku = (distributor_sku or "").strip()[:80] or ""
+
+    prompt = (
+        "You validate distributor spreadsheet rows against Amazon catalog data.\n"
+        "Decide if the Amazon listing is the SAME physical product / same SKU as the line item.\n"
+        "Allow minor wording differences, pack size wording, and regional naming.\n"
+        "Reject only if they are clearly different products or incompatible models.\n"
+        f"{_source_file_prompt_fragment(source_file_hint)}"
+        f"\ndistributor_description: {desc}\n"
+        f"distributor_sku: {sku or '(none)'}\n"
+        f"amazon_asin: {asin}\n"
+        f"amazon_listing_title: {at}\n"
+        f"amazon_listing_brand: {ab}\n\n"
+        'Reply with JSON only, no markdown: {"same_product": true}\n'
+        'or {"same_product": false}\n'
+    )
+
+    url = base_url.rstrip("/") + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "format": "json",
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            record_chat_response(ollama_usage, data)
+    except Exception as e:
+        logger.warning("Ollama ASIN validate request failed: %s", e)
+        return "error", str(e)
+
+    content = (data.get("message") or {}).get("content") or ""
+    parsed = _parse_json_from_content(content)
+    if "same_product" in parsed:
+        sp = parsed["same_product"]
+        if sp is True:
+            return "accept", "llm_same_product"
+        if sp is False:
+            return "reject", "llm_not_same_product"
+    if "match" in parsed:
+        m = parsed["match"]
+        if m is True:
+            return "accept", "llm_match_alias"
+        if m is False:
+            return "reject", "llm_match_false"
+
+    logger.warning("Ollama ASIN validate unparseable JSON (asin=%s): %r", asin, content[:300])
+    return "error", "unparseable_llm_response"
+
+
+def ollama_pick_asin_from_candidates(
+    base_url: str,
+    model: str,
+    *,
+    distributor_sku: str,
+    sheet_description: str,
+    source_file_hint: Optional[str] = None,
+    candidates: list[tuple[str, str]],
+    ollama_usage: Optional[OllamaTokenLedger] = None,
+    timeout: float = 90.0,
+) -> Optional[str]:
+    """
+    Gemma chooses which Amazon ASIN (if any) matches the distributor line, given Keepa titles.
+    ``candidates`` are (asin, title) for listings that already returned from Keepa.
+    """
+    if not candidates:
+        return None
+    body_lines: list[str] = []
+    asin_set: set[str] = set()
+    for i, (a, t) in enumerate(candidates[:22], start=1):
+        aa = str(a).strip().upper()
+        asin_set.add(aa)
+        body_lines.append(f"{i}. {aa} | {(t or '')[:140]}")
+    block = "\n".join(body_lines)
+    sku = (distributor_sku or "").strip()[:80]
+    desc = (sheet_description or "").strip()[:700]
+
+    prompt = (
+        "You match distributor catalog lines to Amazon listings (ASIN + title).\n"
+        "Pick the ONE listing that is the same product / same SKU as the line item.\n"
+        "If none clearly match, answer with null.\n"
+        "Minor naming, pack wording, or region differences are OK.\n"
+        f"{_source_file_prompt_fragment(source_file_hint)}"
+        f"\ndistributor_sku: {sku or '(none)'}\n"
+        f"distributor_description: {desc or '(none)'}\n\n"
+        "Amazon candidates (from Keepa):\n"
+        f"{block}\n\n"
+        'Reply with JSON only: {"chosen_asin": "B0XXXXXXXXXX"} or {"chosen_asin": null}\n'
+    )
+
+    url = base_url.rstrip("/") + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "format": "json",
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            record_chat_response(ollama_usage, data)
+    except Exception as e:
+        logger.warning("Ollama pick-asin failed: %s", e)
+        return None
+
+    content = (data.get("message") or {}).get("content") or ""
+    parsed = _parse_json_from_content(content)
+    raw = parsed.get("chosen_asin")
+    if raw is None:
+        alt = parsed.get("asin")
+        raw = alt
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    pick = str(raw).strip().upper()
+    if pick in asin_set:
+        return pick
+    for a in asin_set:
+        if pick.endswith(a) or a.endswith(pick):
+            return a
+    logger.debug("Ollama pick-asin returned unknown token: %r", raw)
+    return None
+
+
+def ollama_suggest_finder_escalations(
+    base_url: str,
+    model: str,
+    *,
+    distributor_sku: str,
+    sheet_description: str,
+    brand: Optional[str],
+    source_file_hint: Optional[str] = None,
+    attempts_tried: str,
+    ollama_usage: Optional[OllamaTokenLedger] = None,
+    timeout: float = 90.0,
+) -> tuple[list[str], list[str]]:
+    """
+    After basic Keepa finder attempts fail, Gemma proposes extra title strings and part numbers
+    to try with Keepa product_finder (no web search — only strings we feed to Keepa).
+    """
+    sku = (distributor_sku or "").strip()[:80]
+    desc = (sheet_description or "").strip()[:900]
+    br = (brand or "").strip()[:100]
+
+    prompt = (
+        "Keepa product_finder on Amazon failed for this distributor line.\n"
+        "Suggest NEW search strings we should try: short Amazon-style title queries and "
+        "alternate manufacturer part numbers (drop dots, try core model codes, etc.).\n"
+        "Do not invent ASINs. Return only JSON.\n"
+        f"{_source_file_prompt_fragment(source_file_hint)}"
+        f"\ndistributor_sku: {sku or '(none)'}\n"
+        f"distributor_brand_hint: {br or '(none)'}\n"
+        f"distributor_description: {desc or '(none)'}\n"
+        f"already_tried_summary: {attempts_tried[:400]}\n\n"
+        'JSON shape: {"title_queries": ["string", ...], "part_numbers": ["string", ...]}\n'
+        "At most 5 title_queries (each under 120 chars) and 3 part_numbers.\n"
+    )
+
+    url = base_url.rstrip("/") + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "format": "json",
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            record_chat_response(ollama_usage, data)
+    except Exception as e:
+        logger.warning("Ollama finder-escalation suggest failed: %s", e)
+        return [], []
+
+    content = (data.get("message") or {}).get("content") or ""
+    parsed = _parse_json_from_content(content)
+    tq = parsed.get("title_queries") or parsed.get("titles") or []
+    pq = parsed.get("part_numbers") or []
+    titles: list[str] = []
+    parts: list[str] = []
+    if isinstance(tq, list):
+        for x in tq[:5]:
+            if isinstance(x, str) and x.strip():
+                titles.append(x.strip()[:120])
+    if isinstance(pq, list):
+        for x in pq[:3]:
+            if isinstance(x, str) and x.strip():
+                parts.append(_norm_part_hint(x))
+    return titles, parts
+
+
+def _norm_part_hint(s: str) -> str:
+    t = str(s).strip()
+    return t[:120]
+
+
+def ollama_infer_keepa_domain(
+    sample_text: str,
+    base_url: str,
+    model: str,
+    *,
+    default_domain: int,
+    ollama_usage: Optional[OllamaTokenLedger] = None,
+    timeout: float = 75.0,
+) -> int:
+    """
+    Ask Gemma which Amazon marketplace (Keepa ``domain`` id) best matches the sheet language/region.
+    """
+    blob = (sample_text or "").strip()[:6000]
+    if not blob:
+        return default_domain
+
+    prompt = (
+        "You classify B2B / distributor spreadsheet content to choose the best Amazon storefront "
+        "for product lookups (Keepa API domain id).\n\n"
+        "Allowed ids ONLY (pick exactly one integer):\n"
+        "1 = Amazon.com (US), 2 = Amazon.co.uk, 3 = Amazon.de, 4 = Amazon.fr, 5 = Amazon.co.jp, "
+        "6 = Amazon.ca, 8 = Amazon.it, 9 = Amazon.es, 10 = Amazon.in, 11 = Amazon.com.mx, 12 = Amazon.com.br\n\n"
+        "Use product description/title language and regional hints (e.g. CHF prices → often DE/FR; "
+        "German text → 3; UK English → 2; US English → 1; EU multilingual → pick the dominant retail locale).\n\n"
+        "Sample rows (may include multiple lines):\n---\n"
+        f"{blob}\n---\n"
+        'Reply with JSON only, no markdown: {"keepa_domain": <int>}\n'
+    )
+
+    url = base_url.rstrip("/") + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "format": "json",
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            record_chat_response(ollama_usage, data)
+    except Exception as e:
+        logger.warning("Ollama keepa-domain inference failed: %s", e)
+        return default_domain
+
+    content = (data.get("message") or {}).get("content") or ""
+    parsed = _parse_json_from_content(content)
+    raw = parsed.get("keepa_domain")
+    if raw is None:
+        return default_domain
+    try:
+        dom = int(raw)
+    except (TypeError, ValueError):
+        return default_domain
+    if dom not in ALLOWED_KEEPA_DOMAINS:
+        logger.debug("Ollama returned out-of-range keepa_domain=%r", raw)
+        return default_domain
+    return dom
+
+
+def _sheet_text_blob_for_domain(rows: list[dict[str, Any]], max_rows: int = 30, max_chars: int = 5500) -> str:
+    parts: list[str] = []
+    n = 0
+    for r in rows:
+        if n >= max_rows:
+            break
+        t = str(r.get("_sheet_title_text") or "").strip()
+        if len(t) < 4:
+            continue
+        parts.append(t[:900])
+        n += 1
+    blob = "\n---\n".join(parts)
+    return blob[:max_chars]
+
+
+def assign_keepa_domains_to_rows(
+    rows: list[dict[str, Any]],
+    *,
+    default_domain: int,
+    enabled: bool,
+    ollama_base_url: str,
+    ollama_model: str,
+    timeout: float,
+    progress: Optional[Callable[[str, str, int, int], None]] = None,
+    ollama_usage: Optional[OllamaTokenLedger] = None,
+) -> None:
+    """Sets ``row['_keepa_domain']`` (int) for every row, grouped by ``_sheet_name``."""
+    by_sheet: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by_sheet[str(r.get("_sheet_name") or "Sheet")].append(r)
+
+    if not enabled or not (ollama_base_url or "").strip() or not ollama_tags_reachable(ollama_base_url):
+        for r in rows:
+            r["_keepa_domain"] = int(default_domain)
+        return
+
+    names = list(by_sheet.keys())
+    total = len(names) or 1
+    for i, sn in enumerate(names, start=1):
+        rs = by_sheet[sn]
+        if progress:
+            progress(
+                "sheet_domain",
+                f"Gemma → Keepa domain for “{sn[:40]}”… ({i} of {total})",
+                i,
+                total,
+            )
+        blob = _sheet_text_blob_for_domain(rs)
+        if not blob.strip():
+            dom = int(default_domain)
+        else:
+            dom = ollama_infer_keepa_domain(
+                blob,
+                ollama_base_url,
+                ollama_model,
+                default_domain=int(default_domain),
+                ollama_usage=ollama_usage,
+                timeout=min(float(timeout), 120.0),
+            )
+        for r in rs:
+            r["_keepa_domain"] = int(dom)

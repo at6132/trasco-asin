@@ -1,0 +1,9 @@
+# Railway: set this folder as the service root for trasco-web (Next.js).
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

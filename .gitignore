@@ -1,0 +1,14 @@
+.env
+.env.*.local
+frontend/.env.local
+data/
+.trasco_process_history/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.next/
+out/
+dist/
+*.sqlite3

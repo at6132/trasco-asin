@@ -1,0 +1,467 @@
+"""
+Keepa HTTP API: product (ASIN / code), batch product, product_finder (query), throttling.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import sys
+import threading
+import time
+from typing import Any, Callable, Optional
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+if __package__:
+    from .cache import (
+        Cache,
+        get_cached_keepa_by_code,
+        get_cached_keepa_product,
+        set_cached_keepa_by_code,
+        set_cached_keepa_product,
+    )
+else:
+    from cache import (
+        Cache,
+        get_cached_keepa_by_code,
+        get_cached_keepa_product,
+        set_cached_keepa_by_code,
+        set_cached_keepa_product,
+    )
+
+KEEPA_API_BASE = "https://api.keepa.com"
+KEEPA_PRODUCT_URL = f"{KEEPA_API_BASE}/product"
+KEEPA_QUERY_URL = f"{KEEPA_API_BASE}/query"
+
+# Keepa product_finder expects sort as nested arrays, e.g. [["current_SALES","asc"]].
+KEEPA_FINDER_SORT: list[list[str]] = [["current_SALES", "asc"]]
+
+# ASINs are 10-character Amazon identifiers (often B0…; Keepa also returns ISBN-10-style IDs).
+_KEEPA_ASIN_TOKEN = re.compile(r"^[A-Z0-9]{10}$")
+
+
+def is_keepa_style_asin(token: str) -> bool:
+    t = token.strip().upper()
+    return bool(_KEEPA_ASIN_TOKEN.match(t))
+
+DOMAIN_COM = 1
+DOMAIN_UK = 2
+DOMAIN_DE = 3
+DOMAIN_FR = 4
+DOMAIN_JP = 5
+DOMAIN_CA = 6
+DOMAIN_IT = 8
+DOMAIN_ES = 9
+DOMAIN_IN = 10
+DOMAIN_MX = 11
+DOMAIN_BR = 12
+
+
+class KeepaError(Exception):
+    pass
+
+
+class KeepaThrottle:
+    """Thread-safe spacing between live Keepa calls + token-aware backoff."""
+
+    def __init__(self, min_interval_sec: float = 1.05) -> None:
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self.min_interval_sec = min_interval_sec
+
+    def before_request(self) -> None:
+        with self._lock:
+            now = time.time()
+            gap = self.min_interval_sec - (now - self._last)
+            if gap > 0:
+                time.sleep(gap)
+            self._last = time.time()
+
+    def after_response(self, data: dict[str, Any]) -> None:
+        tokens = data.get("tokensLeft")
+        refill_ms = data.get("refillIn")
+        if tokens is not None and tokens < 2 and refill_ms is not None:
+            wait = min(float(refill_ms) / 1000.0 + 0.25, 90.0)
+            time.sleep(wait)
+
+
+def _raise_if_error(data: dict[str, Any]) -> None:
+    if isinstance(data, dict) and data.get("error"):
+        raise KeepaError(str(data.get("error")))
+
+
+def fetch_keepa_product(
+    api_key: str,
+    asin: str,
+    domain: int = DOMAIN_COM,
+    *,
+    stats_days: int = 90,
+    history: int = 0,
+    cache: Optional[Cache] = None,
+    cache_ttl_seconds: int = 86_400,
+    timeout: float = 60.0,
+    throttle: Optional[KeepaThrottle] = None,
+    on_response: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    asin = asin.strip().upper()
+    if not is_keepa_style_asin(asin):
+        raise KeepaError(f"Invalid ASIN format: {asin!r}")
+
+    if cache:
+        hit = get_cached_keepa_product(cache, domain, asin)
+        if hit is not None:
+            return hit
+
+    if throttle:
+        throttle.before_request()
+    params = {
+        "key": api_key,
+        "domain": domain,
+        "asin": asin,
+        "stats": stats_days,
+        "history": history,
+    }
+    with httpx.Client(timeout=timeout) as client:
+        data: Optional[dict[str, Any]] = None
+        for attempt in range(6):
+            r = client.get(KEEPA_PRODUCT_URL, params=params)
+            if r.status_code == 429:
+                time.sleep(2.0 + attempt * 0.5)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        if not isinstance(data, dict):
+            raise KeepaError("Keepa product request failed after retries")
+
+    _raise_if_error(data)
+    if on_response:
+        on_response(data)
+    if throttle:
+        throttle.after_response(data)
+
+    if cache and isinstance(data, dict):
+        set_cached_keepa_product(cache, domain, asin, data, ttl_seconds=cache_ttl_seconds)
+
+    if log.isEnabledFor(logging.DEBUG):
+        fp = first_product(data)
+        t0 = (fp.get("title") or "")[:100] if isinstance(fp, dict) else None
+        log.debug(
+            "keepa product domain=%s asin=%s tokensLeft=%s title0=%r",
+            domain,
+            asin,
+            data.get("tokensLeft") if isinstance(data, dict) else None,
+            t0,
+        )
+
+    return data
+
+
+def fetch_keepa_products_batch(
+    api_key: str,
+    asins: list[str],
+    domain: int = DOMAIN_COM,
+    *,
+    stats_days: int = 90,
+    history: int = 0,
+    cache: Optional[Cache] = None,
+    cache_ttl_seconds: int = 86_400,
+    timeout: float = 90.0,
+    throttle: Optional[KeepaThrottle] = None,
+    on_response: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Single Keepa product request with comma-separated ASINs (max 100).
+    Returns map asin → product dict. Caches each product individually on hit.
+    """
+    clean = [a.strip().upper() for a in asins if a and is_keepa_style_asin(a)]
+    if not clean:
+        return {}
+    uncached: list[str] = []
+    out: dict[str, dict[str, Any]] = {}
+    for a in clean:
+        if cache:
+            hit = get_cached_keepa_product(cache, domain, a)
+            if hit is not None:
+                p = first_product(hit)
+                if p and p.get("asin"):
+                    out[p["asin"]] = p
+                continue
+        uncached.append(a)
+    if not uncached:
+        return out
+
+    for i in range(0, len(uncached), 100):
+        chunk = uncached[i : i + 100]
+        if throttle:
+            throttle.before_request()
+        params = {
+            "key": api_key,
+            "domain": domain,
+            "asin": ",".join(chunk),
+            "stats": stats_days,
+            "history": history,
+        }
+        with httpx.Client(timeout=timeout) as client:
+            data: Optional[dict[str, Any]] = None
+            for attempt in range(6):
+                r = client.get(KEEPA_PRODUCT_URL, params=params)
+                if r.status_code == 429:
+                    time.sleep(2.0 + attempt * 0.5)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
+            if not isinstance(data, dict):
+                raise KeepaError("Keepa batch product request failed after retries")
+
+        _raise_if_error(data)
+        if on_response:
+            on_response(data)
+        if throttle:
+            throttle.after_response(data)
+
+        for p in data.get("products") or []:
+            if isinstance(p, dict) and p.get("asin"):
+                out[str(p["asin"])] = p
+                if cache:
+                    single = {
+                        "products": [p],
+                        "tokensLeft": data.get("tokensLeft"),
+                        "refillIn": data.get("refillIn"),
+                    }
+                    set_cached_keepa_product(cache, domain, str(p["asin"]), single, ttl_seconds=cache_ttl_seconds)
+        if log.isEnabledFor(logging.DEBUG):
+            titles = [
+                (str(p.get("title") or "")[:60] if isinstance(p, dict) else "")
+                for p in (data.get("products") or [])[:3]
+                if isinstance(p, dict)
+            ]
+            log.debug(
+                "keepa batch domain=%s chunk=%s returned_products=%s tokensLeft=%s sample_titles=%s",
+                domain,
+                len(chunk),
+                len(data.get("products") or []),
+                data.get("tokensLeft"),
+                titles,
+            )
+    return out
+
+
+def fetch_keepa_product_by_code(
+    api_key: str,
+    product_code: str,
+    domain: int = DOMAIN_COM,
+    *,
+    stats_days: int = 90,
+    history: int = 0,
+    cache: Optional[Cache] = None,
+    cache_ttl_seconds: int = 86_400,
+    timeout: float = 60.0,
+    throttle: Optional[KeepaThrottle] = None,
+    on_response: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    digits = re.sub(r"\D", "", str(product_code))
+    if len(digits) < 8 or len(digits) > 14:
+        raise KeepaError(f"Invalid product code for Keepa (8–14 digits): {product_code!r}")
+
+    if cache:
+        hit = get_cached_keepa_by_code(cache, domain, digits)
+        if hit is not None:
+            return hit
+
+    if throttle:
+        throttle.before_request()
+    params = {
+        "key": api_key,
+        "domain": domain,
+        "code": digits,
+        "stats": stats_days,
+        "history": history,
+    }
+    with httpx.Client(timeout=timeout) as client:
+        data: Optional[dict[str, Any]] = None
+        for attempt in range(6):
+            r = client.get(KEEPA_PRODUCT_URL, params=params)
+            if r.status_code == 429:
+                time.sleep(2.0 + attempt * 0.5)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        if not isinstance(data, dict):
+            raise KeepaError("Keepa code request failed after retries")
+
+    _raise_if_error(data)
+    if on_response:
+        on_response(data)
+    if throttle:
+        throttle.after_response(data)
+
+    if cache and isinstance(data, dict):
+        set_cached_keepa_by_code(cache, domain, digits, data, ttl_seconds=cache_ttl_seconds)
+
+    if log.isEnabledFor(logging.DEBUG):
+        fp = first_product(data)
+        t0 = (fp.get("title") or "")[:100] if isinstance(fp, dict) else None
+        log.debug(
+            "keepa by_code domain=%s code=%s tokensLeft=%s title0=%r",
+            domain,
+            digits,
+            data.get("tokensLeft") if isinstance(data, dict) else None,
+            t0,
+        )
+
+    return data
+
+
+def product_finder_asins(
+    api_key: str,
+    domain: int,
+    selection: dict[str, Any],
+    *,
+    n_products: int = 20,
+    timeout: float = 90.0,
+    throttle: Optional[KeepaThrottle] = None,
+    on_response: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """
+    Keepa product_finder → `GET /query` with JSON `selection`.
+    Returns (asin_list, raw_json).
+    """
+    sel = dict(selection)
+    sel.setdefault("perPage", min(n_products, 100))
+    if throttle:
+        throttle.before_request()
+    payload = {
+        "key": api_key,
+        "domain": domain,
+        "selection": json.dumps(sel, separators=(",", ":")),
+    }
+    with httpx.Client(timeout=timeout) as client:
+        data: Optional[dict[str, Any]] = None
+        for attempt in range(6):
+            r = client.get(KEEPA_QUERY_URL, params=payload)
+            if r.status_code == 429:
+                time.sleep(2.0 + attempt * 0.5)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        if not isinstance(data, dict):
+            raise KeepaError("Keepa product_finder request failed after retries")
+
+    _raise_if_error(data)
+    if on_response:
+        on_response(data)
+    if throttle:
+        throttle.after_response(data)
+
+    raw_list = data.get("asinList")
+    if not isinstance(raw_list, list):
+        return [], data
+    asins = [
+        str(x).strip().upper()
+        for x in raw_list
+        if x and is_keepa_style_asin(str(x))
+    ]
+    if log.isEnabledFor(logging.DEBUG):
+        sel_log = {k: v for k, v in sel.items() if k != "key"}
+        log.debug(
+            "keepa product_finder domain=%s tokensLeft=%s raw_asin_list_len=%s filtered=%s "
+            "selection=%s sample_filtered=%s",
+            domain,
+            data.get("tokensLeft"),
+            len(raw_list) if isinstance(raw_list, list) else None,
+            len(asins),
+            sel_log,
+            asins[:10],
+        )
+    return asins, data
+
+
+def first_product(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    products = payload.get("products")
+    if not products or not isinstance(products, list):
+        return None
+    first = products[0]
+    return first if isinstance(first, dict) else None
+
+
+def best_product_by_title(
+    payload: dict[str, Any], sheet_title: Optional[str]
+) -> Optional[dict[str, Any]]:
+    """Pick the product whose title best matches sheet_title; falls back to first."""
+    products = payload.get("products")
+    if not products or not isinstance(products, list):
+        return None
+    dicts = [p for p in products if isinstance(p, dict)]
+    if not dicts:
+        return None
+    if len(dicts) == 1 or not sheet_title or not sheet_title.strip():
+        return dicts[0]
+
+    from backend.validator import title_similarity
+
+    best, best_score = dicts[0], -1.0
+    for p in dicts:
+        t = p.get("title")
+        if not isinstance(t, str):
+            continue
+        sc = title_similarity(sheet_title, t)
+        if sc > best_score:
+            best, best_score = p, sc
+    return best
+
+
+def _load_dotenv_simple() -> None:
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    path = os.path.join(root, ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
+if __name__ == "__main__":
+    _load_dotenv_simple()
+    if __package__:
+        from .cache import Cache as _Cache
+    else:
+        from cache import Cache as _Cache
+
+    key = os.environ.get("KEEPA_API_KEY", "").strip()
+    if not key:
+        print("Set KEEPA_API_KEY in .env or the environment, then re-run.")
+        sys.exit(1)
+
+    test_asin = (sys.argv[1] if len(sys.argv) > 1 else "B0D1XD1ZV3").strip().upper()
+    c = _Cache()
+    th = KeepaThrottle()
+    try:
+        payload = fetch_keepa_product(key, test_asin, DOMAIN_COM, cache=c, history=0, throttle=th)
+    except Exception as e:
+        print("Request failed:", e)
+        sys.exit(2)
+
+    prod = first_product(payload)
+    print("tokensLeft:", payload.get("tokensLeft"))
+    if prod:
+        print("ASIN:", prod.get("asin"))
+        title = prod.get("title") or ""
+        print("title:", title[:120])
+    else:
+        print("No product in response (check ASIN / marketplace).")
+    c.close()
