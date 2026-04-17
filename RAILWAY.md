@@ -72,11 +72,11 @@ Repo root includes `railway.toml` and `Procfile` for the API; `frontend/railway.
    |----------|--------|
    | `KEEPA_API_KEY` | Required for `/api/v1/process`. |
    | `ANTHROPIC_API_KEY` | **Recommended (production):** Claude Haiku maps columns / headers on the largest sheet and CSV. |
-   | `HAIKU_MODEL` | Optional; default in code is `claude-3-5-haiku-20241022`. Set to your Haiku model id (e.g. newer Haiku 4.5 id from Anthropic docs). |
+   | `HAIKU_MODEL` | Default **`claude-haiku-4-5-20251001`**. Older `claude-3-5-haiku-20241022` is **retired** (API returns **404**). Override with any valid Messages API model id from [Anthropic models](https://docs.anthropic.com/en/docs/about-claude/models). |
    | `CORS_ALLOW_ORIGINS` | **Required** for the browser UI: comma-separated origins (no path), e.g. `https://trasco-web-production.up.railway.app`. Non-local hosts must use `https://`. Trailing slashes are stripped. If unset, only `localhost` / `127.0.0.1` dev origins are allowed. |
-   | `USE_OLLAMA_ASIN_VALIDATE` | Default **false** for Haiku-only Railway; `true` only if Ollama is reachable from the API. |
-   | `USE_OLLAMA_RESOLVER_GEMMA` | Default **false** for Haiku-only; `true` with Ollama for extra SKU resolution. |
-   | `USE_OLLAMA_SHEET_DOMAIN` | Default **false** for Haiku-only; `true` with Ollama for per-sheet marketplace hints (else `KEEPA_DOMAIN` only). |
+   | `USE_OLLAMA_ASIN_VALIDATE` | Default **true**: LLM ASIN vs listing check uses **Haiku** when `ANTHROPIC_API_KEY` is set, else **Ollama** if reachable. Set `false` to skip that step entirely. |
+   | `USE_OLLAMA_RESOLVER_GEMMA` | Default **false**. **Haiku** runs finder pick/escalation whenever `ANTHROPIC_API_KEY` is set; set this `true` only if you also want **Ollama** in the mix when a URL is configured. |
+   | `USE_OLLAMA_SHEET_DOMAIN` | Default **false**. **Haiku** infers per-sheet Keepa domain whenever `ANTHROPIC_API_KEY` is set; set this `true` only if you also want **Ollama** domain inference when reachable. |
    | `TRASCO_CACHE_DB` | Optional. Absolute path to the SQLite cache file; use with a **volume** so Keepa cache survives redeploys (see **§6**). |
    | `TRASCO_PROCESS_HISTORY_DIR` | Optional. Directory for “Recent” Excel files + manifest; use with a **volume** (see **§6**). |
 

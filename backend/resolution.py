@@ -1,6 +1,7 @@
 """
 Tier-2/3 Keepa resolution: product_finder + batch product fetch, SKU→ASIN cache.
-Uses Gemma (Ollama) to pick among finder hits; escalates with LLM-suggested Keepa queries.
+Uses Claude Haiku when ``ANTHROPIC_API_KEY`` is set, else local Ollama, to pick among finder hits
+and to suggest escalation queries.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from backend.lookup import (
     product_finder_asins,
 )
 from backend.ollama_asin_validate import (
+    haiku_pick_asin_from_candidates,
+    haiku_suggest_finder_escalations,
     ollama_pick_asin_from_candidates,
     ollama_suggest_finder_escalations,
     ollama_tags_reachable,
@@ -49,7 +52,7 @@ def _pick_best_asin_heuristic(
     products: dict[str, dict[str, Any]],
     sheet_title: Optional[str],
 ) -> tuple[Optional[str], float, str]:
-    """Highest title-similarity ASIN among loaded products (no hard reject — Gemma handles ambiguity)."""
+    """Highest title-similarity ASIN among loaded products (no hard reject — LLM handles ambiguity)."""
     best_a: Optional[str] = None
     best_s = -1.0
     for a in candidates:
@@ -145,7 +148,9 @@ def _run_one_finder_attempt(
     ollama_base_url: Optional[str],
     ollama_model: str,
     ollama_timeout_sec: float,
-    use_gemma_pick: bool,
+    use_llm_pick: bool,
+    anthropic_api_key: Optional[str] = None,
+    haiku_model: str = "",
 ) -> Optional[tuple[dict[str, Any], str, float, str]]:
     """
     Returns (product, reason_suffix, finder_score, finder_how) or None.
@@ -179,11 +184,19 @@ def _run_one_finder_attempt(
         return None
 
     picked: Optional[str] = None
-    if (
-        use_gemma_pick
-        and ollama_base_url
-        and ollama_tags_reachable(ollama_base_url)
-    ):
+    if use_llm_pick and (anthropic_api_key or "").strip():
+        picked = haiku_pick_asin_from_candidates(
+            (anthropic_api_key or "").strip(),
+            haiku_model or "claude-haiku-4-5-20251001",
+            distributor_sku=sku_display,
+            sheet_description=(title_hint or "")[:800],
+            source_file_hint=source_file_hint,
+            candidates=rows,
+            timeout=min(ollama_timeout_sec, 120.0),
+        )
+        if picked and prods.get(picked):
+            return prods[picked], f"{label}:haiku_pick", 1.0, "haiku_pick"
+    elif use_llm_pick and ollama_base_url and ollama_tags_reachable(ollama_base_url):
         picked = ollama_pick_asin_from_candidates(
             ollama_base_url,
             ollama_model,
@@ -195,7 +208,7 @@ def _run_one_finder_attempt(
             timeout=min(ollama_timeout_sec, 120.0),
         )
         if picked and prods.get(picked):
-            return prods[picked], f"{label}:gemma_pick", 1.0, "gemma_pick"
+            return prods[picked], f"{label}:ollama_pick", 1.0, "ollama_pick"
 
     best, score, how = _pick_best_asin_heuristic(take, prods, title_hint)
     if best and prods.get(best):
@@ -214,6 +227,8 @@ def resolve_via_product_finder(
     title_hint: Optional[str],
     cache_ttl_seconds: int,
     throttle: Any,
+    anthropic_api_key: str = "",
+    haiku_model: str = "",
     ollama_base_url: str = "",
     ollama_model: str = "gemma3:27b",
     ollama_timeout_sec: float = 120.0,
@@ -240,7 +255,9 @@ def resolve_via_product_finder(
             return None, f"cache:{cached.get('reason', 'not_found')}"
 
     part = mpn_n or sku_k
-    use_gemma = bool(use_ollama_resolver_gemma and (ollama_base_url or "").strip())
+    use_llm_pick = bool(
+        use_ollama_resolver_gemma and (ollama_base_url or "").strip()
+    ) or bool((anthropic_api_key or "").strip())
     obase = (ollama_base_url or "").strip() or None
     sku_display = (sku or mpn or "").strip()[:80]
 
@@ -284,7 +301,9 @@ def resolve_via_product_finder(
                 ollama_base_url=obase,
                 ollama_model=ollama_model,
                 ollama_timeout_sec=ollama_timeout_sec,
-                use_gemma_pick=use_gemma,
+                use_llm_pick=use_llm_pick,
+                anthropic_api_key=anthropic_api_key,
+                haiku_model=haiku_model,
             )
             if hit:
                 return _cache_hit(hit)
@@ -293,7 +312,19 @@ def resolve_via_product_finder(
         except Exception as e:
             last_err = f"{label}:{e}"
 
-    if use_gemma and obase and ollama_tags_reachable(obase):
+    if use_llm_pick and (anthropic_api_key or "").strip():
+        trace = ",".join(tried_labels) + "|" + (last_err or "")
+        extra_titles, extra_parts = haiku_suggest_finder_escalations(
+            (anthropic_api_key or "").strip(),
+            haiku_model or "claude-haiku-4-5-20251001",
+            distributor_sku=sku_display,
+            sheet_description=(title_hint or "")[:900],
+            brand=brand,
+            source_file_hint=source_file_hint,
+            attempts_tried=trace[:500],
+            timeout=min(ollama_timeout_sec, 120.0),
+        )
+    elif use_llm_pick and obase and ollama_tags_reachable(obase):
         trace = ",".join(tried_labels) + "|" + (last_err or "")
         extra_titles, extra_parts = ollama_suggest_finder_escalations(
             obase,
@@ -306,6 +337,10 @@ def resolve_via_product_finder(
             ollama_usage=ollama_usage,
             timeout=min(ollama_timeout_sec, 120.0),
         )
+    else:
+        extra_titles, extra_parts = [], []
+
+    if extra_titles or extra_parts:
         extra_attempts: list[tuple[str, dict[str, Any]]] = []
         for i, tq in enumerate(extra_titles):
             if len(tq.strip()) >= 3:
@@ -337,7 +372,9 @@ def resolve_via_product_finder(
                     ollama_base_url=obase,
                     ollama_model=ollama_model,
                     ollama_timeout_sec=ollama_timeout_sec,
-                    use_gemma_pick=use_gemma,
+                    use_llm_pick=use_llm_pick,
+                    anthropic_api_key=anthropic_api_key,
+                    haiku_model=haiku_model,
                 )
                 if hit:
                     return _cache_hit(hit)

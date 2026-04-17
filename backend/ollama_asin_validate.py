@@ -1,5 +1,6 @@
 """
-Post-resolution check: Ollama (Gemma) decides if a Keepa listing matches the sheet line.
+LLM helpers for Keepa workflows: Claude Haiku (Anthropic) when configured, else local Ollama.
+Same prompts/JSON contracts for equivalent steps on either backend.
 """
 
 from __future__ import annotations
@@ -29,6 +30,39 @@ def ollama_tags_reachable(base_url: str, timeout: float = 3.0) -> bool:
             return r.status_code == 200
     except Exception:
         return False
+
+
+def _anthropic_first_message_text(
+    api_key: str,
+    model: str,
+    user_prompt: str,
+    *,
+    max_tokens: int,
+    timeout: float,
+) -> str:
+    """POST /v1/messages and concatenate assistant text blocks."""
+    url = "https://api.anthropic.com/v1/messages"
+    body = {
+        "model": model or "claude-haiku-4-5-20251001",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+    headers = {
+        "x-api-key": api_key.strip(),
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    with httpx.Client(timeout=timeout) as client:
+        r = client.post(url, json=body, headers=headers)
+        if r.status_code >= 400:
+            snippet = (r.text or "").strip().replace("\n", " ")[:400]
+            raise RuntimeError(f"anthropic_http_{r.status_code}:{snippet or r.reason_phrase}")
+        data = r.json()
+    text = ""
+    for block in data.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text += block.get("text") or ""
+    return text
 
 
 def _parse_json_from_content(content: str) -> dict[str, Any]:
@@ -65,6 +99,99 @@ def _source_file_prompt_fragment(source_file_hint: Optional[str]) -> str:
     )
 
 
+def _asin_match_validation_prompt(
+    *,
+    sheet_description: str,
+    distributor_sku: Optional[str],
+    asin: str,
+    amazon_title: Optional[str],
+    amazon_brand: Optional[str],
+    source_file_hint: Optional[str] = None,
+) -> Optional[str]:
+    """Shared LLM prompt; returns None if distributor description is empty."""
+    desc = (sheet_description or "").strip()[:800]
+    if not desc:
+        return None
+    at = (amazon_title or "").strip()[:500] or "(no title from Keepa)"
+    ab = (amazon_brand or "").strip()[:120] or "(unknown brand)"
+    sku = (distributor_sku or "").strip()[:80] or ""
+    return (
+        "You validate distributor spreadsheet rows against Amazon catalog data.\n"
+        "Decide if the Amazon listing is the SAME physical product / same SKU as the line item.\n"
+        "Allow minor wording differences, pack size wording, and regional naming.\n"
+        "Reject only if they are clearly different products or incompatible models.\n"
+        f"{_source_file_prompt_fragment(source_file_hint)}"
+        f"\ndistributor_description: {desc}\n"
+        f"distributor_sku: {sku or '(none)'}\n"
+        f"amazon_asin: {asin}\n"
+        f"amazon_listing_title: {at}\n"
+        f"amazon_listing_brand: {ab}\n\n"
+        'Reply with JSON only, no markdown: {"same_product": true}\n'
+        'or {"same_product": false}\n'
+    )
+
+
+def _verdict_from_same_product_json(
+    parsed: dict[str, Any], *, asin: str, content: str, log_label: str
+) -> tuple[Verdict, str]:
+    if "same_product" in parsed:
+        sp = parsed["same_product"]
+        if sp is True:
+            return "accept", "llm_same_product"
+        if sp is False:
+            return "reject", "llm_not_same_product"
+    if "match" in parsed:
+        m = parsed["match"]
+        if m is True:
+            return "accept", "llm_match_alias"
+        if m is False:
+            return "reject", "llm_match_false"
+    logger.warning("%s ASIN validate unparseable JSON (asin=%s): %r", log_label, asin, content[:300])
+    return "error", "unparseable_llm_response"
+
+
+def haiku_validate_asin_vs_description(
+    api_key: str,
+    model: str,
+    *,
+    sheet_description: str,
+    distributor_sku: Optional[str],
+    asin: str,
+    amazon_title: Optional[str],
+    amazon_brand: Optional[str],
+    source_file_hint: Optional[str] = None,
+    timeout: float = 120.0,
+) -> tuple[Verdict, str]:
+    """
+    Same contract as ``ollama_validate_asin_vs_description``: Claude Haiku decides same_product.
+    """
+    prompt = _asin_match_validation_prompt(
+        sheet_description=sheet_description,
+        distributor_sku=distributor_sku,
+        asin=asin,
+        amazon_title=amazon_title,
+        amazon_brand=amazon_brand,
+        source_file_hint=source_file_hint,
+    )
+    if not prompt:
+        return "error", "empty_sheet_description"
+
+    try:
+        text = _anthropic_first_message_text(
+            api_key.strip(),
+            model or "claude-haiku-4-5-20251001",
+            prompt,
+            max_tokens=512,
+            timeout=min(float(timeout), 120.0),
+        )
+    except Exception as e:
+        logger.warning("Haiku ASIN validate request failed: %s", e)
+        return "error", str(e)
+
+    parsed = _parse_json_from_content(text)
+    return _verdict_from_same_product_json(parsed, asin=asin, content=text, log_label="Haiku")
+
+
 def ollama_validate_asin_vs_description(
     base_url: str,
     model: str,
@@ -79,32 +206,20 @@ def ollama_validate_asin_vs_description(
     timeout: float = 120.0,
 ) -> tuple[Verdict, str]:
     """
-    Ask Gemma whether the Amazon ASIN is the same product as the distributor line.
+    Local Ollama: whether the Amazon ASIN is the same product as the distributor line.
 
     Returns (verdict, note). ``reject`` only when the model explicitly answers not a match.
     """
-    desc = (sheet_description or "").strip()[:800]
-    if not desc:
-        return "error", "empty_sheet_description"
-
-    at = (amazon_title or "").strip()[:500] or "(no title from Keepa)"
-    ab = (amazon_brand or "").strip()[:120] or "(unknown brand)"
-    sku = (distributor_sku or "").strip()[:80] or ""
-
-    prompt = (
-        "You validate distributor spreadsheet rows against Amazon catalog data.\n"
-        "Decide if the Amazon listing is the SAME physical product / same SKU as the line item.\n"
-        "Allow minor wording differences, pack size wording, and regional naming.\n"
-        "Reject only if they are clearly different products or incompatible models.\n"
-        f"{_source_file_prompt_fragment(source_file_hint)}"
-        f"\ndistributor_description: {desc}\n"
-        f"distributor_sku: {sku or '(none)'}\n"
-        f"amazon_asin: {asin}\n"
-        f"amazon_listing_title: {at}\n"
-        f"amazon_listing_brand: {ab}\n\n"
-        'Reply with JSON only, no markdown: {"same_product": true}\n'
-        'or {"same_product": false}\n'
+    prompt = _asin_match_validation_prompt(
+        sheet_description=sheet_description,
+        distributor_sku=distributor_sku,
+        asin=asin,
+        amazon_title=amazon_title,
+        amazon_brand=amazon_brand,
+        source_file_hint=source_file_hint,
     )
+    if not prompt:
+        return "error", "empty_sheet_description"
 
     url = base_url.rstrip("/") + "/api/chat"
     payload = {
@@ -125,21 +240,87 @@ def ollama_validate_asin_vs_description(
 
     content = (data.get("message") or {}).get("content") or ""
     parsed = _parse_json_from_content(content)
-    if "same_product" in parsed:
-        sp = parsed["same_product"]
-        if sp is True:
-            return "accept", "llm_same_product"
-        if sp is False:
-            return "reject", "llm_not_same_product"
-    if "match" in parsed:
-        m = parsed["match"]
-        if m is True:
-            return "accept", "llm_match_alias"
-        if m is False:
-            return "reject", "llm_match_false"
+    return _verdict_from_same_product_json(parsed, asin=asin, content=content, log_label="Ollama")
 
-    logger.warning("Ollama ASIN validate unparseable JSON (asin=%s): %r", asin, content[:300])
-    return "error", "unparseable_llm_response"
+
+def _finder_pick_asin_prompt_and_asins(
+    *,
+    distributor_sku: str,
+    sheet_description: str,
+    source_file_hint: Optional[str],
+    candidates: list[tuple[str, str]],
+) -> tuple[Optional[str], set[str]]:
+    if not candidates:
+        return None, set()
+    body_lines: list[str] = []
+    asin_set: set[str] = set()
+    for i, (a, t) in enumerate(candidates[:22], start=1):
+        aa = str(a).strip().upper()
+        asin_set.add(aa)
+        body_lines.append(f"{i}. {aa} | {(t or '')[:140]}")
+    block = "\n".join(body_lines)
+    sku = (distributor_sku or "").strip()[:80]
+    desc = (sheet_description or "").strip()[:700]
+    prompt = (
+        "You match distributor catalog lines to Amazon listings (ASIN + title).\n"
+        "Pick the ONE listing that is the same product / same SKU as the line item.\n"
+        "If none clearly match, answer with null.\n"
+        "Minor naming, pack wording, or region differences are OK.\n"
+        f"{_source_file_prompt_fragment(source_file_hint)}"
+        f"\ndistributor_sku: {sku or '(none)'}\n"
+        f"distributor_description: {desc or '(none)'}\n\n"
+        "Amazon candidates (from Keepa):\n"
+        f"{block}\n\n"
+        'Reply with JSON only: {"chosen_asin": "B0XXXXXXXXXX"} or {"chosen_asin": null}\n'
+    )
+    return prompt, asin_set
+
+
+def _chosen_asin_from_llm_text(text: str, asin_set: set[str], log_label: str) -> Optional[str]:
+    parsed = _parse_json_from_content(text)
+    raw = parsed.get("chosen_asin")
+    if raw is None:
+        alt = parsed.get("asin")
+        raw = alt
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    pick = str(raw).strip().upper()
+    if pick in asin_set:
+        return pick
+    for a in asin_set:
+        if pick.endswith(a) or a.endswith(pick):
+            return a
+    logger.debug("%s pick-asin returned unknown token: %r", log_label, raw)
+    return None
+
+
+def haiku_pick_asin_from_candidates(
+    api_key: str,
+    model: str,
+    *,
+    distributor_sku: str,
+    sheet_description: str,
+    source_file_hint: Optional[str] = None,
+    candidates: list[tuple[str, str]],
+    timeout: float = 90.0,
+) -> Optional[str]:
+    """Claude Haiku: same JSON contract as ``ollama_pick_asin_from_candidates``."""
+    prompt, asin_set = _finder_pick_asin_prompt_and_asins(
+        distributor_sku=distributor_sku,
+        sheet_description=sheet_description,
+        source_file_hint=source_file_hint,
+        candidates=candidates,
+    )
+    if not prompt or not asin_set:
+        return None
+    try:
+        text = _anthropic_first_message_text(
+            api_key, model, prompt, max_tokens=512, timeout=min(float(timeout), 120.0)
+        )
+    except Exception as e:
+        logger.warning("Haiku pick-asin failed: %s", e)
+        return None
+    return _chosen_asin_from_llm_text(text, asin_set, "Haiku")
 
 
 def ollama_pick_asin_from_candidates(
@@ -154,33 +335,17 @@ def ollama_pick_asin_from_candidates(
     timeout: float = 90.0,
 ) -> Optional[str]:
     """
-    Gemma chooses which Amazon ASIN (if any) matches the distributor line, given Keepa titles.
+    Local Ollama: choose which Amazon ASIN (if any) matches the distributor line, given Keepa titles.
     ``candidates`` are (asin, title) for listings that already returned from Keepa.
     """
-    if not candidates:
-        return None
-    body_lines: list[str] = []
-    asin_set: set[str] = set()
-    for i, (a, t) in enumerate(candidates[:22], start=1):
-        aa = str(a).strip().upper()
-        asin_set.add(aa)
-        body_lines.append(f"{i}. {aa} | {(t or '')[:140]}")
-    block = "\n".join(body_lines)
-    sku = (distributor_sku or "").strip()[:80]
-    desc = (sheet_description or "").strip()[:700]
-
-    prompt = (
-        "You match distributor catalog lines to Amazon listings (ASIN + title).\n"
-        "Pick the ONE listing that is the same product / same SKU as the line item.\n"
-        "If none clearly match, answer with null.\n"
-        "Minor naming, pack wording, or region differences are OK.\n"
-        f"{_source_file_prompt_fragment(source_file_hint)}"
-        f"\ndistributor_sku: {sku or '(none)'}\n"
-        f"distributor_description: {desc or '(none)'}\n\n"
-        "Amazon candidates (from Keepa):\n"
-        f"{block}\n\n"
-        'Reply with JSON only: {"chosen_asin": "B0XXXXXXXXXX"} or {"chosen_asin": null}\n'
+    prompt, asin_set = _finder_pick_asin_prompt_and_asins(
+        distributor_sku=distributor_sku,
+        sheet_description=sheet_description,
+        source_file_hint=source_file_hint,
+        candidates=candidates,
     )
+    if not prompt or not asin_set:
+        return None
 
     url = base_url.rstrip("/") + "/api/chat"
     payload = {
@@ -200,21 +365,79 @@ def ollama_pick_asin_from_candidates(
         return None
 
     content = (data.get("message") or {}).get("content") or ""
+    return _chosen_asin_from_llm_text(content, asin_set, "Ollama")
+
+
+def _finder_escalation_user_prompt(
+    *,
+    distributor_sku: str,
+    sheet_description: str,
+    brand: Optional[str],
+    source_file_hint: Optional[str],
+    attempts_tried: str,
+) -> str:
+    sku = (distributor_sku or "").strip()[:80]
+    desc = (sheet_description or "").strip()[:900]
+    br = (brand or "").strip()[:100]
+    return (
+        "Keepa product_finder on Amazon failed for this distributor line.\n"
+        "Suggest NEW search strings we should try: short Amazon-style title queries and "
+        "alternate manufacturer part numbers (drop dots, try core model codes, etc.).\n"
+        "Do not invent ASINs. Return only JSON.\n"
+        f"{_source_file_prompt_fragment(source_file_hint)}"
+        f"\ndistributor_sku: {sku or '(none)'}\n"
+        f"distributor_brand_hint: {br or '(none)'}\n"
+        f"distributor_description: {desc or '(none)'}\n"
+        f"already_tried_summary: {attempts_tried[:400]}\n\n"
+        'JSON shape: {"title_queries": ["string", ...], "part_numbers": ["string", ...]}\n'
+        "At most 5 title_queries (each under 120 chars) and 3 part_numbers.\n"
+    )
+
+
+def _parse_finder_escalation_json(content: str) -> tuple[list[str], list[str]]:
     parsed = _parse_json_from_content(content)
-    raw = parsed.get("chosen_asin")
-    if raw is None:
-        alt = parsed.get("asin")
-        raw = alt
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return None
-    pick = str(raw).strip().upper()
-    if pick in asin_set:
-        return pick
-    for a in asin_set:
-        if pick.endswith(a) or a.endswith(pick):
-            return a
-    logger.debug("Ollama pick-asin returned unknown token: %r", raw)
-    return None
+    tq = parsed.get("title_queries") or parsed.get("titles") or []
+    pq = parsed.get("part_numbers") or []
+    titles: list[str] = []
+    parts: list[str] = []
+    if isinstance(tq, list):
+        for x in tq[:5]:
+            if isinstance(x, str) and x.strip():
+                titles.append(x.strip()[:120])
+    if isinstance(pq, list):
+        for x in pq[:3]:
+            if isinstance(x, str) and x.strip():
+                parts.append(_norm_part_hint(x))
+    return titles, parts
+
+
+def haiku_suggest_finder_escalations(
+    api_key: str,
+    model: str,
+    *,
+    distributor_sku: str,
+    sheet_description: str,
+    brand: Optional[str],
+    source_file_hint: Optional[str] = None,
+    attempts_tried: str,
+    timeout: float = 90.0,
+) -> tuple[list[str], list[str]]:
+    """Claude Haiku: same contract as ``ollama_suggest_finder_escalations``."""
+    prompt = _finder_escalation_user_prompt(
+        distributor_sku=distributor_sku,
+        sheet_description=sheet_description,
+        brand=brand,
+        source_file_hint=source_file_hint,
+        attempts_tried=attempts_tried,
+    )
+    try:
+        text = _anthropic_first_message_text(
+            api_key, model, prompt, max_tokens=1024, timeout=min(float(timeout), 120.0)
+        )
+    except Exception as e:
+        logger.warning("Haiku finder-escalation suggest failed: %s", e)
+        return [], []
+    return _parse_finder_escalation_json(text)
 
 
 def ollama_suggest_finder_escalations(
@@ -230,25 +453,15 @@ def ollama_suggest_finder_escalations(
     timeout: float = 90.0,
 ) -> tuple[list[str], list[str]]:
     """
-    After basic Keepa finder attempts fail, Gemma proposes extra title strings and part numbers
+    After basic Keepa finder attempts fail, local Ollama proposes extra title strings and part numbers
     to try with Keepa product_finder (no web search — only strings we feed to Keepa).
     """
-    sku = (distributor_sku or "").strip()[:80]
-    desc = (sheet_description or "").strip()[:900]
-    br = (brand or "").strip()[:100]
-
-    prompt = (
-        "Keepa product_finder on Amazon failed for this distributor line.\n"
-        "Suggest NEW search strings we should try: short Amazon-style title queries and "
-        "alternate manufacturer part numbers (drop dots, try core model codes, etc.).\n"
-        "Do not invent ASINs. Return only JSON.\n"
-        f"{_source_file_prompt_fragment(source_file_hint)}"
-        f"\ndistributor_sku: {sku or '(none)'}\n"
-        f"distributor_brand_hint: {br or '(none)'}\n"
-        f"distributor_description: {desc or '(none)'}\n"
-        f"already_tried_summary: {attempts_tried[:400]}\n\n"
-        'JSON shape: {"title_queries": ["string", ...], "part_numbers": ["string", ...]}\n'
-        "At most 5 title_queries (each under 120 chars) and 3 part_numbers.\n"
+    prompt = _finder_escalation_user_prompt(
+        distributor_sku=distributor_sku,
+        sheet_description=sheet_description,
+        brand=brand,
+        source_file_hint=source_file_hint,
+        attempts_tried=attempts_tried,
     )
 
     url = base_url.rstrip("/") + "/api/chat"
@@ -269,25 +482,67 @@ def ollama_suggest_finder_escalations(
         return [], []
 
     content = (data.get("message") or {}).get("content") or ""
-    parsed = _parse_json_from_content(content)
-    tq = parsed.get("title_queries") or parsed.get("titles") or []
-    pq = parsed.get("part_numbers") or []
-    titles: list[str] = []
-    parts: list[str] = []
-    if isinstance(tq, list):
-        for x in tq[:5]:
-            if isinstance(x, str) and x.strip():
-                titles.append(x.strip()[:120])
-    if isinstance(pq, list):
-        for x in pq[:3]:
-            if isinstance(x, str) and x.strip():
-                parts.append(_norm_part_hint(x))
-    return titles, parts
+    return _parse_finder_escalation_json(content)
 
 
 def _norm_part_hint(s: str) -> str:
     t = str(s).strip()
     return t[:120]
+
+
+def _keepa_domain_user_prompt(sample_text: str) -> Optional[str]:
+    blob = (sample_text or "").strip()[:6000]
+    if not blob:
+        return None
+    return (
+        "You classify B2B / distributor spreadsheet content to choose the best Amazon storefront "
+        "for product lookups (Keepa API domain id).\n\n"
+        "Allowed ids ONLY (pick exactly one integer):\n"
+        "1 = Amazon.com (US), 2 = Amazon.co.uk, 3 = Amazon.de, 4 = Amazon.fr, 5 = Amazon.co.jp, "
+        "6 = Amazon.ca, 8 = Amazon.it, 9 = Amazon.es, 10 = Amazon.in, 11 = Amazon.com.mx, 12 = Amazon.com.br\n\n"
+        "Use product description/title language and regional hints (e.g. CHF prices → often DE/FR; "
+        "German text → 3; UK English → 2; US English → 1; EU multilingual → pick the dominant retail locale).\n\n"
+        "Sample rows (may include multiple lines):\n---\n"
+        f"{blob}\n---\n"
+        'Reply with JSON only, no markdown: {"keepa_domain": <int>}\n'
+    )
+
+
+def _parse_keepa_domain_int(parsed: dict[str, Any], *, default_domain: int, raw_log: Any) -> int:
+    raw = parsed.get("keepa_domain")
+    if raw is None:
+        return default_domain
+    try:
+        dom = int(raw)
+    except (TypeError, ValueError):
+        return default_domain
+    if dom not in ALLOWED_KEEPA_DOMAINS:
+        logger.debug("LLM returned out-of-range keepa_domain=%r", raw_log)
+        return default_domain
+    return dom
+
+
+def haiku_infer_keepa_domain(
+    sample_text: str,
+    api_key: str,
+    model: str,
+    *,
+    default_domain: int,
+    timeout: float = 75.0,
+) -> int:
+    """Claude Haiku: same task as ``ollama_infer_keepa_domain``."""
+    prompt = _keepa_domain_user_prompt(sample_text)
+    if not prompt:
+        return default_domain
+    try:
+        text = _anthropic_first_message_text(
+            api_key, model, prompt, max_tokens=256, timeout=min(float(timeout), 120.0)
+        )
+    except Exception as e:
+        logger.warning("Haiku keepa-domain inference failed: %s", e)
+        return default_domain
+    parsed = _parse_json_from_content(text)
+    return _parse_keepa_domain_int(parsed, default_domain=default_domain, raw_log=parsed.get("keepa_domain"))
 
 
 def ollama_infer_keepa_domain(
@@ -300,24 +555,11 @@ def ollama_infer_keepa_domain(
     timeout: float = 75.0,
 ) -> int:
     """
-    Ask Gemma which Amazon marketplace (Keepa ``domain`` id) best matches the sheet language/region.
+    Local Ollama model: which Amazon marketplace (Keepa ``domain`` id) best matches the sheet language/region.
     """
-    blob = (sample_text or "").strip()[:6000]
-    if not blob:
+    prompt = _keepa_domain_user_prompt(sample_text)
+    if not prompt:
         return default_domain
-
-    prompt = (
-        "You classify B2B / distributor spreadsheet content to choose the best Amazon storefront "
-        "for product lookups (Keepa API domain id).\n\n"
-        "Allowed ids ONLY (pick exactly one integer):\n"
-        "1 = Amazon.com (US), 2 = Amazon.co.uk, 3 = Amazon.de, 4 = Amazon.fr, 5 = Amazon.co.jp, "
-        "6 = Amazon.ca, 8 = Amazon.it, 9 = Amazon.es, 10 = Amazon.in, 11 = Amazon.com.mx, 12 = Amazon.com.br\n\n"
-        "Use product description/title language and regional hints (e.g. CHF prices → often DE/FR; "
-        "German text → 3; UK English → 2; US English → 1; EU multilingual → pick the dominant retail locale).\n\n"
-        "Sample rows (may include multiple lines):\n---\n"
-        f"{blob}\n---\n"
-        'Reply with JSON only, no markdown: {"keepa_domain": <int>}\n'
-    )
 
     url = base_url.rstrip("/") + "/api/chat"
     payload = {
@@ -338,17 +580,7 @@ def ollama_infer_keepa_domain(
 
     content = (data.get("message") or {}).get("content") or ""
     parsed = _parse_json_from_content(content)
-    raw = parsed.get("keepa_domain")
-    if raw is None:
-        return default_domain
-    try:
-        dom = int(raw)
-    except (TypeError, ValueError):
-        return default_domain
-    if dom not in ALLOWED_KEEPA_DOMAINS:
-        logger.debug("Ollama returned out-of-range keepa_domain=%r", raw)
-        return default_domain
-    return dom
+    return _parse_keepa_domain_int(parsed, default_domain=default_domain, raw_log=parsed.get("keepa_domain"))
 
 
 def _sheet_text_blob_for_domain(rows: list[dict[str, Any]], max_rows: int = 30, max_chars: int = 5500) -> str:
@@ -371,8 +603,10 @@ def assign_keepa_domains_to_rows(
     *,
     default_domain: int,
     enabled: bool,
-    ollama_base_url: str,
-    ollama_model: str,
+    anthropic_api_key: str = "",
+    haiku_model: str = "",
+    ollama_base_url: str = "",
+    ollama_model: str = "",
     timeout: float,
     progress: Optional[Callable[[str, str, int, int], None]] = None,
     ollama_usage: Optional[OllamaTokenLedger] = None,
@@ -382,25 +616,41 @@ def assign_keepa_domains_to_rows(
     for r in rows:
         by_sheet[str(r.get("_sheet_name") or "Sheet")].append(r)
 
-    if not enabled or not (ollama_base_url or "").strip() or not ollama_tags_reachable(ollama_base_url):
+    if not enabled:
+        for r in rows:
+            r["_keepa_domain"] = int(default_domain)
+        return
+
+    use_haiku = bool((anthropic_api_key or "").strip())
+    use_ollama = bool((ollama_base_url or "").strip() and ollama_tags_reachable(ollama_base_url))
+    if not use_haiku and not use_ollama:
         for r in rows:
             r["_keepa_domain"] = int(default_domain)
         return
 
     names = list(by_sheet.keys())
     total = len(names) or 1
+    label = "Claude Haiku" if use_haiku else "Ollama"
     for i, sn in enumerate(names, start=1):
         rs = by_sheet[sn]
         if progress:
             progress(
                 "sheet_domain",
-                f"Gemma → Keepa domain for “{sn[:40]}”… ({i} of {total})",
+                f"{label} → Keepa domain for “{sn[:40]}”… ({i} of {total})",
                 i,
                 total,
             )
         blob = _sheet_text_blob_for_domain(rs)
         if not blob.strip():
             dom = int(default_domain)
+        elif use_haiku:
+            dom = haiku_infer_keepa_domain(
+                blob,
+                (anthropic_api_key or "").strip(),
+                haiku_model or "claude-haiku-4-5-20251001",
+                default_domain=int(default_domain),
+                timeout=min(float(timeout), 120.0),
+            )
         else:
             dom = ollama_infer_keepa_domain(
                 blob,

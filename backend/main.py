@@ -1,8 +1,8 @@
 """
 FastAPI entrypoint: health, parse preview, full process → Excel (ASIN / GTIN / SKU tiers).
 
-Column / header semantics use Claude Haiku when ANTHROPIC_API_KEY is set. Optional Ollama
-(Gemma) augments sheet domain, SKU resolution, and ASIN checks when enabled and reachable.
+Column / header mapping and downstream LLM steps prefer Claude Haiku when ANTHROPIC_API_KEY is set.
+Optional local Ollama is used only when Anthropic is not configured or a step falls back.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from backend.lookup import (
 )
 from backend.ollama_asin_validate import (
     assign_keepa_domains_to_rows,
+    haiku_validate_asin_vs_description,
     ollama_tags_reachable,
     ollama_validate_asin_vs_description,
 )
@@ -63,13 +64,15 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma3:27b"
     anthropic_api_key: str = ""
-    haiku_model: str = "claude-3-5-haiku-20241022"
+    # Snapshot id (Anthropic retired claude-3-5-haiku-20241022; Haiku 4.5 is current default).
+    haiku_model: str = "claude-haiku-4-5-20251001"
 
-    use_ollama_asin_validate: bool = False
+    # LLM ASIN vs listing check when request allows (Haiku if ANTHROPIC_API_KEY, else Ollama if reachable).
+    use_ollama_asin_validate: bool = True
     ollama_asin_validate_timeout_sec: float = 120.0
-    # Gemma in SKU resolver: pick among finder hits + LLM-suggested Keepa queries when basic finder fails
+    # When true with Ollama URL: also allow Ollama for SKU finder pick/escalation (Haiku used if ANTHROPIC_API_KEY set).
     use_ollama_resolver_gemma: bool = False
-    # Gemma infers Keepa marketplace (domain) per worksheet from description/title language
+    # When true: allow Ollama for per-sheet Keepa domain (Haiku runs automatically when ANTHROPIC_API_KEY is set).
     use_ollama_sheet_domain: bool = False
 
     # Comma-separated browser origins allowed to call this API (e.g. your Next.js URL on Railway).
@@ -327,10 +330,13 @@ def run_process_pipeline(
         _r["_source_file_hint"] = _upload_stem
     p("parse", f"Parsed {len(rows_in)} row(s) (max {max_rows}).", 1, 1)
 
+    domain_llm_enabled = bool(settings.use_ollama_sheet_domain or settings.anthropic_api_key.strip())
     assign_keepa_domains_to_rows(
         rows_in,
         default_domain=int(settings.keepa_domain),
-        enabled=bool(settings.use_ollama_sheet_domain),
+        enabled=domain_llm_enabled,
+        anthropic_api_key=settings.anthropic_api_key,
+        haiku_model=settings.haiku_model,
         ollama_base_url=settings.ollama_base_url,
         ollama_model=settings.ollama_model,
         timeout=float(settings.ollama_asin_validate_timeout_sec),
@@ -443,6 +449,8 @@ def run_process_pipeline(
                 title_hint=row0.get("_sheet_title_text"),
                 cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
                 throttle=throttle,
+                anthropic_api_key=settings.anthropic_api_key,
+                haiku_model=settings.haiku_model,
                 ollama_base_url=settings.ollama_base_url,
                 ollama_model=settings.ollama_model,
                 ollama_timeout_sec=float(settings.ollama_asin_validate_timeout_sec),
@@ -501,18 +509,25 @@ def run_process_pipeline(
         sections.append((sheet_name, headers, out_rows))
 
     if validate_queue and do_llm_asin:
-        if not ollama_tags_reachable(settings.ollama_base_url):
+        n_val = len(validate_queue)
+        tmo = float(settings.ollama_asin_validate_timeout_sec)
+        use_haiku_asin = bool(settings.anthropic_api_key.strip())
+        ollama_ok = bool(
+            (not use_haiku_asin)
+            and (settings.ollama_base_url or "").strip()
+            and ollama_tags_reachable(settings.ollama_base_url)
+        )
+        if not use_haiku_asin and not ollama_ok:
             logger.warning(
-                "Ollama not reachable; skipping Gemma ASIN validation (%s rows)",
-                len(validate_queue),
+                "Skipping LLM ASIN validation: set ANTHROPIC_API_KEY (Haiku) or run Ollama (%s rows)",
+                n_val,
             )
         else:
-            n_val = len(validate_queue)
-            tmo = float(settings.ollama_asin_validate_timeout_sec)
+            label = "Haiku" if use_haiku_asin else "Ollama"
             for i, (line, row, asin_h, conf_h, prod) in enumerate(validate_queue, start=1):
                 p(
                     "ollama_asin",
-                    f"Gemma validates ASIN vs description ({i} of {n_val})…",
+                    f"{label} validates ASIN vs listing ({i} of {n_val})…",
                     i,
                     n_val,
                 )
@@ -533,24 +548,38 @@ def run_process_pipeline(
                     if isinstance(v, str) and v.strip():
                         kb = v.strip()
                         break
-                verdict, note = ollama_validate_asin_vs_description(
-                    settings.ollama_base_url,
-                    settings.ollama_model,
-                    sheet_description=desc,
-                    distributor_sku=sku_s,
-                    asin=ra0,
-                    amazon_title=kt,
-                    amazon_brand=kb,
-                    source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
-                    ollama_usage=ollama_usage,
-                    timeout=tmo,
-                )
+                if use_haiku_asin:
+                    verdict, note = haiku_validate_asin_vs_description(
+                        settings.anthropic_api_key.strip(),
+                        settings.haiku_model,
+                        sheet_description=desc,
+                        distributor_sku=sku_s,
+                        asin=ra0,
+                        amazon_title=kt,
+                        amazon_brand=kb,
+                        source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
+                        timeout=tmo,
+                    )
+                else:
+                    verdict, note = ollama_validate_asin_vs_description(
+                        settings.ollama_base_url,
+                        settings.ollama_model,
+                        sheet_description=desc,
+                        distributor_sku=sku_s,
+                        asin=ra0,
+                        amazon_title=kt,
+                        amazon_brand=kb,
+                        source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
+                        ollama_usage=ollama_usage,
+                        timeout=tmo,
+                    )
                 if verdict == "reject":
                     line[asin_h] = ""
                     line[conf_h] = "NOT FOUND (LLM)"
                 elif verdict == "error":
                     logger.debug(
-                        "Gemma ASIN validate inconclusive asin=%s note=%s",
+                        "%s ASIN validate inconclusive asin=%s note=%s",
+                        label,
                         ra0,
                         note,
                     )

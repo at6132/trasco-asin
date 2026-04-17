@@ -10,7 +10,7 @@ function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_BASE?.replace(/\/$/, "") || defaultApi;
 }
 
-/** When false (default), `/process/start` uses Haiku path on API; set `NEXT_PUBLIC_USE_OLLAMA=true` for local Gemma. */
+/** When true, API may use Ollama for parse / sheet-domain; ASIN double-check uses Haiku whenever `ANTHROPIC_API_KEY` is set. */
 function useOllamaQueryFlags(): boolean {
   return process.env.NEXT_PUBLIC_USE_OLLAMA === "true";
 }
@@ -74,7 +74,7 @@ const PHASE_USER: Record<string, string> = {
   keepa_direct: "Looking up products",
   keepa_sku: "Finding matches",
   assemble: "Putting it together",
-  ollama_asin: "Checking ASINs",
+  ollama_asin: "Double-checking ASINs",
   workbook: "Building your file",
   done: "All set",
   queued: "Starting",
@@ -120,8 +120,9 @@ export default function HomeClient() {
         fd.append("file", file);
         const q = new URLSearchParams();
         const ollama = useOllamaQueryFlags();
+        // use_ollama: Gemma for parse/sheet-domain paths only. use_ollama_asin_validate: LLM ASIN double-check (Haiku on API when ANTHROPIC_API_KEY, else Gemma).
         q.set("use_ollama", ollama ? "true" : "false");
-        q.set("use_ollama_asin_validate", ollama ? "true" : "false");
+        q.set("use_ollama_asin_validate", "true");
         const startR = await fetch(`${apiBase()}/api/v1/process/start?${q.toString()}`, {
           method: "POST",
           body: fd,

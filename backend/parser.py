@@ -1,6 +1,6 @@
 """
-Spreadsheet ingestion: multi-sheet xlsx, CSV, header detection, semantic columns,
-Ollama (Gemma) with optional Claude Haiku fallback — not ASIN-centric.
+Spreadsheet ingestion: multi-sheet xlsx, CSV, header detection, semantic columns.
+Uses Claude Haiku when configured; optional local Ollama as fallback — not ASIN-centric.
 """
 
 from __future__ import annotations
@@ -355,7 +355,9 @@ def _anthropic_sheet_understanding(
     }
     with httpx.Client(timeout=timeout) as client:
         r = client.post(url, json=body, headers=headers)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            snippet = (r.text or "").strip().replace("\n", " ")[:600]
+            raise RuntimeError(f"Anthropic HTTP {r.status_code}: {snippet or r.reason_phrase}")
         data = r.json()
     parts = data.get("content") or []
     text = ""
@@ -429,7 +431,21 @@ def _parse_sheet_matrix(
     if use_llm:
         preview = raw[: min(len(raw), 80)]
         llm_ok = False
-        if allow_ollama and _ollama_reachable(ollama_base_url):
+        if anthropic_api_key.strip():
+            try:
+                ollama_header_1based, ollama_cols = _anthropic_sheet_understanding(
+                    preview,
+                    guessed_header_1based=guess_idx + 1,
+                    headers_if_guess=guess_headers,
+                    api_key=anthropic_api_key.strip(),
+                    model=haiku_model or "claude-haiku-4-5-20251001",
+                    timeout=min(timeout, 120.0),
+                )
+                method = "haiku"
+                llm_ok = True
+            except Exception as e:
+                logger.warning("Anthropic Haiku sheet understanding failed: %s", e)
+        if not llm_ok and allow_ollama and _ollama_reachable(ollama_base_url):
             try:
                 ollama_header_1based, ollama_cols = _ollama_sheet_understanding(
                     preview,
@@ -444,20 +460,6 @@ def _parse_sheet_matrix(
                 method = "ollama"
             except Exception as e:
                 logger.warning("Ollama sheet understanding failed: %s", e)
-        if not llm_ok and anthropic_api_key.strip():
-            try:
-                ollama_header_1based, ollama_cols = _anthropic_sheet_understanding(
-                    preview,
-                    guessed_header_1based=guess_idx + 1,
-                    headers_if_guess=guess_headers,
-                    api_key=anthropic_api_key.strip(),
-                    model=haiku_model or "claude-3-5-haiku-20241022",
-                    timeout=min(timeout, 120.0),
-                )
-                method = "haiku"
-                llm_ok = True
-            except Exception as e:
-                logger.warning("Anthropic Haiku sheet understanding failed: %s", e)
         if not llm_ok:
             ollama_cols = {k: None for k in SEMANTIC_FIELDS}
 
@@ -549,7 +551,7 @@ def parse_uploaded_file(
     use_ollama: bool = True,
     timeout: float = 240.0,
     anthropic_api_key: str = "",
-    haiku_model: str = "claude-3-5-haiku-20241022",
+    haiku_model: str = "claude-haiku-4-5-20251001",
     ollama_usage: Optional[OllamaTokenLedger] = None,
 ) -> ParseResult:
     fn = (filename or "upload").lower()
@@ -682,7 +684,7 @@ def parse_workbook_bytes(
     use_ollama: bool = True,
     timeout: float = 240.0,
     anthropic_api_key: str = "",
-    haiku_model: str = "claude-3-5-haiku-20241022",
+    haiku_model: str = "claude-haiku-4-5-20251001",
     ollama_usage: Optional[OllamaTokenLedger] = None,
 ) -> ParseResult:
     return parse_uploaded_file(
