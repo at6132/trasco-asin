@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Trasco ASIN",
-  description: "Upload spreadsheets, preview parsing, and download Keepa-enriched results.",
+  title: "Trasco · Sheet to ASINs",
+  description: "Upload your catalog sheet. Claude Haiku + Keepa. Download enriched results.",
 };
 
 export default function RootLayout({

@@ -29,12 +29,7 @@ function formatDuration(sec: number): string {
   return `${m}m ${s < 10 ? s.toFixed(1) : Math.round(s)}s`;
 }
 
-function fmtInt(n: number): string {
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(n);
-}
-
 type Props = {
-  /** Increment after a successful full process to refetch the list. */
   refreshTrigger: number;
 };
 
@@ -89,43 +84,32 @@ export default function ProcessHistoryPanel({ refreshTrigger }: Props) {
   }, []);
 
   return (
-    <section className="space-y-3">
+    <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
-          Process history
-        </h2>
+        <h2 className="text-sm font-semibold text-zinc-200">Recent</h2>
         <button
           type="button"
           onClick={() => void refreshHistory()}
           disabled={historyBusy}
-          className="rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+          className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-200 transition hover:bg-cyan-500/20 disabled:opacity-50"
         >
-          {historyBusy ? "Loading…" : "Refresh"}
+          {historyBusy ? "…" : "Refresh"}
         </button>
       </div>
-      <p className="text-xs text-zinc-500 dark:text-zinc-400">
-        Completed runs are stored under{" "}
-        <code className="rounded bg-zinc-200 px-1 py-0.5 dark:bg-zinc-800">.trasco_process_history</code> on the API
-        host (override with{" "}
-        <code className="rounded bg-zinc-200 px-1 py-0.5 dark:bg-zinc-800">TRASCO_PROCESS_HISTORY_DIR</code>
-        ). Ollama token counts sum{" "}
-        <code className="rounded bg-zinc-200 px-1 py-0.5 dark:bg-zinc-800">prompt_eval_count</code> +{" "}
-        <code className="rounded bg-zinc-200 px-1 py-0.5 dark:bg-zinc-800">eval_count</code> per Gemma call.
-      </p>
-      {historyError ? <p className="text-sm text-red-700 dark:text-red-300">{historyError}</p> : null}
+      {historyError ? (
+        <p className="text-sm text-red-300/90">{historyError}</p>
+      ) : null}
       {history.length === 0 && !historyBusy ? (
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">No completed runs yet.</p>
+        <p className="text-sm text-zinc-500">No runs yet.</p>
       ) : (
-        <div className="overflow-x-auto rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-          <table className="w-full min-w-[640px] text-left text-xs">
-            <thead className="border-b border-zinc-200 bg-zinc-50 text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800/80 dark:text-zinc-400">
+        <div className="overflow-x-auto rounded-xl border border-white/10 bg-slate-950/50">
+          <table className="w-full min-w-[420px] text-left text-xs">
+            <thead className="border-b border-white/10 bg-white/[0.04] text-[10px] uppercase tracking-wider text-zinc-500">
               <tr>
-                <th className="px-3 py-2 font-medium">File</th>
-                <th className="px-3 py-2 font-medium">Finished</th>
-                <th className="px-3 py-2 font-medium">Time</th>
-                <th className="px-3 py-2 font-medium">Gemma tokens</th>
-                <th className="px-3 py-2 font-medium">Calls</th>
-                <th className="px-3 py-2 font-medium">Download</th>
+                <th className="px-3 py-2.5 font-medium">Output</th>
+                <th className="px-3 py-2.5 font-medium">When</th>
+                <th className="px-3 py-2.5 font-medium">Duration</th>
+                <th className="px-3 py-2.5 font-medium" />
               </tr>
             </thead>
             <tbody>
@@ -134,7 +118,6 @@ export default function ProcessHistoryPanel({ refreshTrigger }: Props) {
                   (typeof h.download_name === "string" && h.download_name) ||
                   (typeof h.source_filename === "string" && h.source_filename) ||
                   h.job_id;
-                const tokens = Number(h.ollama_total_tokens) || 0;
                 const dur = Number(h.duration_sec) || 0;
                 const when = h.completed_at
                   ? new Date(h.completed_at).toLocaleString(undefined, {
@@ -143,37 +126,28 @@ export default function ProcessHistoryPanel({ refreshTrigger }: Props) {
                     })
                   : "—";
                 return (
-                  <tr
-                    key={h.job_id}
-                    className="border-b border-zinc-100 last:border-0 dark:border-zinc-800"
-                  >
+                  <tr key={h.job_id} className="border-b border-white/5 last:border-0 hover:bg-white/[0.02]">
                     <td
-                      className="max-w-[200px] truncate px-3 py-2 font-mono text-[11px] text-zinc-800 dark:text-zinc-200"
+                      className="max-w-[220px] truncate px-3 py-2.5 text-[11px] text-cyan-100/90"
                       title={name}
                     >
                       {name}
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-zinc-600 dark:text-zinc-400">{when}</td>
-                    <td className="whitespace-nowrap px-3 py-2 tabular-nums text-zinc-700 dark:text-zinc-300">
+                    <td className="whitespace-nowrap px-3 py-2.5 text-zinc-500">{when}</td>
+                    <td className="whitespace-nowrap px-3 py-2.5 tabular-nums text-zinc-400">
                       {formatDuration(dur)}
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2 tabular-nums text-zinc-700 dark:text-zinc-300">
-                      {fmtInt(tokens)}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 tabular-nums text-zinc-600 dark:text-zinc-400">
-                      {fmtInt(Number(h.ollama_requests) || 0)}
-                    </td>
-                    <td className="px-3 py-2">
+                    <td className="px-3 py-2.5 text-right">
                       {h.file_available ? (
                         <button
                           type="button"
                           onClick={() => void downloadHistoryFile(h.job_id, String(h.download_name || name))}
-                          className="rounded-md bg-emerald-700 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-500"
+                          className="rounded-lg bg-gradient-to-r from-cyan-500 to-blue-600 px-2.5 py-1 text-[11px] font-semibold text-slate-950 hover:brightness-110"
                         >
-                          Excel
+                          Download
                         </button>
                       ) : (
-                        <span className="text-zinc-400">—</span>
+                        <span className="text-zinc-600">—</span>
                       )}
                     </td>
                   </tr>
@@ -183,6 +157,6 @@ export default function ProcessHistoryPanel({ refreshTrigger }: Props) {
           </table>
         </div>
       )}
-    </section>
+    </div>
   );
 }

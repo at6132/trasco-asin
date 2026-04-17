@@ -1,11 +1,15 @@
 """
 FastAPI entrypoint: health, parse preview, full process → Excel (ASIN / GTIN / SKU tiers).
+
+Column / header semantics use Claude Haiku when ANTHROPIC_API_KEY is set. Optional Ollama
+(Gemma) augments sheet domain, SKU resolution, and ASIN checks when enabled and reachable.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import threading
 import time
 import uuid
@@ -61,15 +65,19 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     haiku_model: str = "claude-3-5-haiku-20241022"
 
-    use_ollama_asin_validate: bool = True
+    use_ollama_asin_validate: bool = False
     ollama_asin_validate_timeout_sec: float = 120.0
     # Gemma in SKU resolver: pick among finder hits + LLM-suggested Keepa queries when basic finder fails
-    use_ollama_resolver_gemma: bool = True
+    use_ollama_resolver_gemma: bool = False
     # Gemma infers Keepa marketplace (domain) per worksheet from description/title language
-    use_ollama_sheet_domain: bool = True
+    use_ollama_sheet_domain: bool = False
 
     # Comma-separated browser origins allowed to call this API (e.g. your Next.js URL on Railway).
     cors_allow_origins: str = ""
+
+    # Optional absolute path to Keepa / resolver SQLite cache (default: repo `data/trasco_cache.sqlite3`).
+    # On Railway, point at a volume path if you want cache to survive redeploys.
+    trasco_cache_db: str = ""
 
 
 settings = Settings()
@@ -80,7 +88,8 @@ _cache: Optional[Cache] = None
 def get_cache() -> Cache:
     global _cache
     if _cache is None:
-        _cache = Cache()
+        raw = (settings.trasco_cache_db or "").strip()
+        _cache = Cache(Path(raw).expanduser()) if raw else Cache()
     return _cache
 
 
@@ -94,7 +103,7 @@ async def lifespan(app: FastAPI):
         _cache = None
 
 
-app = FastAPI(title="Trasco ASIN API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Trasco ASIN API (Haiku + Keepa)", version="0.2.0", lifespan=lifespan)
 
 
 def _normalize_cors_origin(origin: str) -> Optional[str]:
@@ -153,7 +162,7 @@ def health() -> dict[str, str]:
 @app.post("/api/v1/parse")
 async def parse_sheet(
     file: UploadFile = File(...),
-    use_ollama: bool = True,
+    use_ollama: bool = False,
 ) -> JSONResponse:
     if not _allowed_upload(file.filename or ""):
         raise HTTPException(400, "Upload an .xlsx, .xlsm, or .csv file.")
@@ -669,8 +678,8 @@ async def _run_process_job(
 @app.post("/api/v1/process")
 async def process_sheet(
     file: UploadFile = File(...),
-    use_ollama: bool = True,
-    use_ollama_asin_validate: bool = True,
+    use_ollama: bool = False,
+    use_ollama_asin_validate: bool = False,
     max_rows: int = 500,
 ) -> StreamingResponse:
     if not settings.keepa_api_key.strip():
@@ -708,8 +717,8 @@ async def process_sheet(
 @app.post("/api/v1/process/start")
 async def process_start(
     file: UploadFile = File(...),
-    use_ollama: bool = True,
-    use_ollama_asin_validate: bool = True,
+    use_ollama: bool = False,
+    use_ollama_asin_validate: bool = False,
     max_rows: int = 500,
 ) -> dict[str, str]:
     if not settings.keepa_api_key.strip():

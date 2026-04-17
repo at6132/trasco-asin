@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 @dataclass
 class OllamaTokenLedger:
-    """Sums ``prompt_eval_count`` and ``eval_count`` from Ollama chat completions."""
+    """Running totals for one process run."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0

@@ -71,13 +71,14 @@ Repo root includes `railway.toml` and `Procfile` for the API; `frontend/railway.
    | Variable | Notes |
    |----------|--------|
    | `KEEPA_API_KEY` | Required for `/api/v1/process`. |
-   | `ANTHROPIC_API_KEY` | Required for Haiku-based header / column mapping when Ollama is not used. |
+   | `ANTHROPIC_API_KEY` | **Recommended (production):** Claude Haiku maps columns / headers on the largest sheet and CSV. |
    | `HAIKU_MODEL` | Optional; default in code is `claude-3-5-haiku-20241022`. Set to your Haiku model id (e.g. newer Haiku 4.5 id from Anthropic docs). |
    | `CORS_ALLOW_ORIGINS` | **Required** for the browser UI: comma-separated origins (no path), e.g. `https://trasco-web-production.up.railway.app`. Non-local hosts must use `https://`. Trailing slashes are stripped. If unset, only `localhost` / `127.0.0.1` dev origins are allowed. |
-   | `USE_OLLAMA_ASIN_VALIDATE` | Set `false` if you do not run Ollama in production. |
-   | `USE_OLLAMA_RESOLVER_GEMMA` | Set `false` without Ollama. |
-   | `USE_OLLAMA_SHEET_DOMAIN` | Set `false` without Ollama (uses `KEEPA_DOMAIN` only). |
-   | `TRASCO_PROCESS_HISTORY_DIR` | Optional; defaults to `.trasco_process_history` under the app cwd (ephemeral on Railway unless you attach a volume). |
+   | `USE_OLLAMA_ASIN_VALIDATE` | Default **false** for Haiku-only Railway; `true` only if Ollama is reachable from the API. |
+   | `USE_OLLAMA_RESOLVER_GEMMA` | Default **false** for Haiku-only; `true` with Ollama for extra SKU resolution. |
+   | `USE_OLLAMA_SHEET_DOMAIN` | Default **false** for Haiku-only; `true` with Ollama for per-sheet marketplace hints (else `KEEPA_DOMAIN` only). |
+   | `TRASCO_CACHE_DB` | Optional. Absolute path to the SQLite cache file; use with a **volume** so Keepa cache survives redeploys (see **§6**). |
+   | `TRASCO_PROCESS_HISTORY_DIR` | Optional. Directory for “Recent” Excel files + manifest; use with a **volume** (see **§6**). |
 
 5. Copy the **public URL** of this service (e.g. `https://trasco-api-production-xxxx.up.railway.app`). You will plug it into the frontend as `NEXT_PUBLIC_API_BASE`.
 
@@ -104,15 +105,16 @@ Repo root includes `railway.toml` and `Procfile` for the API; `frontend/railway.
    | Variable | Notes |
    |----------|--------|
    | `NEXT_PUBLIC_API_BASE` | Full backend URL, **no trailing slash**, e.g. `https://trasco-api-production-xxxx.up.railway.app`. Must be set **before** `npm run build` so it is inlined into the client bundle. After changing it, **redeploy** the frontend. |
+   | `NEXT_PUBLIC_USE_OLLAMA` | Omit or leave unset for **Haiku-first** (browser sends `use_ollama=false`). Set to **`true`** only if you run Ollama and want the UI to request Gemma paths from the API. |
    | `NIXPACKS_NODE_VERSION` | Set to **`20`** if the builder still picks Node 18 (Next 16 needs **≥ 20.9**). The repo also ships `frontend/.nvmrc`, `frontend/.node-version`, `frontend/nixpacks.toml`, and `package.json` `engines.node` to prefer Node 20. |
 
 6. Set **`CORS_ALLOW_ORIGINS`** on the **backend** to this frontend’s public URL.
 
-## 3. Haiku-only behavior (no Ollama on Railway)
+## 3. Default: Claude Haiku (production)
 
-- In the UI, you can **turn off** “Use Ollama (Gemma) for header detection”.
-- If **`ANTHROPIC_API_KEY`** is set on the API, the parser still runs **Claude Haiku** for the **largest sheet** (and for CSV), so column mapping works without Ollama.
-- SKU resolver Gemma, per-sheet Keepa domain, and ASIN validation still expect Ollama unless you disable those flags with the env vars above.
+- **`ANTHROPIC_API_KEY`** + **`HAIKU_MODEL`** on the API drive **column / header mapping** (largest sheet + CSV). This is the intended **Railway** setup.
+- Keep **`USE_OLLAMA_*`** on the API set to **`false`** unless you deploy **Ollama** reachable from the API.
+- The web app defaults to **`use_ollama=false`** on `/process/start` (Haiku path). Set **`NEXT_PUBLIC_USE_OLLAMA=true`** on the frontend service only if you intentionally use Ollama from the browser.
 
 ## 4. Health check
 
@@ -120,4 +122,27 @@ Point Railway’s health check path to: **`/health`**.
 
 ## 5. Local `.env`
 
-Copy `.env.example` to `.env` at the repo root for local `uvicorn`; the frontend can use `frontend/.env.local` with `NEXT_PUBLIC_API_BASE=http://127.0.0.1:8000`.
+Copy `.env.example` to `.env` at the repo root for local `uvicorn`. For the Next app, use `frontend/.env.local` with e.g. `NEXT_PUBLIC_API_BASE=http://127.0.0.1:8000` (and optional `NEXT_PUBLIC_USE_OLLAMA=true` if you run Ollama locally).
+
+## 6. Cache, “Recent” downloads, and whether you need a database
+
+**You do not need a separate Railway database (Postgres, etc.).** The API uses:
+
+| Feature | Storage | Works on Railway without extra services? |
+|--------|---------|-------------------------------------------|
+| **Keepa / resolver caching** | **SQLite** file (`data/trasco_cache.sqlite3` by default) | **Yes.** Same container disk; cache is shared across all requests on that instance. |
+| **Recent runs + re-download** | Directory **`.trasco_process_history`** (manifest + per-job `.xlsx`) | **Yes** for the same deploy. |
+| **Upload → process → download** | In-memory job + browser download | **Yes**, as long as `KEEPA_API_KEY`, **`CORS_ALLOW_ORIGINS`**, and **`NEXT_PUBLIC_API_BASE`** (no trailing slash, set before frontend build) are correct. |
+
+**Ephemeral disk:** Railway’s default filesystem is **wiped on redeploy** and is **not shared** if you ever run **multiple replicas** of the API. After a redeploy, the SQLite cache and “Recent” files are gone until rebuilt by traffic (cache repopulates from Keepa; history starts empty). That is normal unless you add persistence.
+
+**Optional: keep cache + history across redeploys** — add a **Railway volume**, mount it (e.g. `/data`), then set on the **API** service:
+
+| Variable | Example | Purpose |
+|----------|---------|--------|
+| `TRASCO_CACHE_DB` | `/data/trasco_cache.sqlite3` | SQLite cache file path (Keepa JSON + resolver tiers). |
+| `TRASCO_PROCESS_HISTORY_DIR` | `/data/process_history` | Folder for `manifest.json` and `{job_id}.xlsx` for the UI “Recent” table. |
+
+Create the mount once in the Railway dashboard; both paths must live **on the volume**. Still **no Postgres** — only paths change.
+
+**Ollama:** Default UI sends `use_ollama=false` (Haiku-first). Use **`NEXT_PUBLIC_USE_OLLAMA=true`** and **`USE_OLLAMA_*=true`** on the API only when Ollama is deployed (see §3).
