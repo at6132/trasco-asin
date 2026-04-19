@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     # LLM ASIN vs listing check when request allows (Haiku if ANTHROPIC_API_KEY, else Ollama if reachable).
     use_ollama_asin_validate: bool = True
     ollama_asin_validate_timeout_sec: float = 120.0
+    # Space out Haiku ASIN checks (~50 RPM org limits). Set 0 to rely only on 429 retries in ollama_asin_validate.
+    anthropic_asin_validate_min_interval_sec: float = 1.25
     # When true with Ollama URL: also allow Ollama for SKU finder pick/escalation (Haiku used if ANTHROPIC_API_KEY set).
     use_ollama_resolver_gemma: bool = False
     # When true: allow Ollama for per-sheet Keepa domain (Haiku runs automatically when ANTHROPIC_API_KEY is set).
@@ -216,6 +218,35 @@ def _direct_lookup_key(row: dict[str, Any]) -> Optional[tuple[str, str]]:
     return None
 
 
+def _trace_snip(s: str, max_len: int = 420) -> str:
+    t = (s or "").replace("\n", " ").replace("\r", " ").strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3] + "..."
+
+
+def _append_trace(base: Optional[str], part: str, *, max_len: int = 950) -> str:
+    p = _trace_snip(part, max_len=max_len)
+    if not base:
+        return p
+    merged = f"{base}; {p}"
+    return merged if len(merged) <= max_len else merged[: max_len - 3] + "..."
+
+
+def _identifier_flags(row: dict[str, Any]) -> str:
+    """Compact bitmask-style hint for which normalized identifiers exist on the row."""
+
+    def has(k: str) -> str:
+        v = row.get(k)
+        if v is None or v is False:
+            return "0"
+        if isinstance(v, str) and not v.strip():
+            return "0"
+        return "1"
+
+    return f"A{has('_asin')}G{has('_gtin')}S{has('_sku')}M{has('_mpn')}"
+
+
 def _group_rows_by_sheet(rows: list[dict[str, Any]]) -> "OrderedDict[str, list[dict[str, Any]]]":
     groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
     for row in rows:
@@ -231,28 +262,42 @@ def _resolved_asin_confidence_product(
     errors: dict[tuple[int, str, str], str],
     sku_results: dict[str, tuple[Optional[dict[str, Any]], str]],
     settings: Settings,
-) -> tuple[str, str, Optional[dict[str, Any]]]:
-    """Amazon ASIN (or empty), confidence tier, and Keepa product dict when resolved."""
+) -> tuple[str, str, Optional[dict[str, Any]], str]:
+    """Amazon ASIN, confidence tier, Keepa product dict when resolved, and a compact trace string."""
     sheet_title = row.get("_sheet_title_text")
     sheet_brand = row.get("_sheet_brand")
     domain = int(row.get("_keepa_domain") or settings.keepa_domain)
     dkey = _direct_lookup_key(row)
     sk = sku_resolve_storage_key(domain, row)
+    flags = _identifier_flags(row)
 
     prod: Optional[dict[str, Any]] = None
+    base_trace = ""
     if dkey:
         dk = (domain, dkey[0], dkey[1])
+        kind, raw_val = dkey[0], str(dkey[1])
+        val_snip = _trace_snip(f"{kind}={raw_val}", 72)
         if dk in errors:
-            return "", "NOT FOUND", None
+            err = _trace_snip(errors[dk], 220)
+            return "", "NOT FOUND", None, f"path=direct|{val_snip}|keepa_err={err}"
         prod = keepa_products.get(dk)
         if not prod:
-            return "", "NOT FOUND", None
+            return "", "NOT FOUND", None, f"path=direct|{val_snip}|no_product"
+        base_trace = f"path=direct|{val_snip}"
     elif sk and sk in sku_results:
-        prod, _ = sku_results[sk]
+        prod, sku_reason = sku_results[sk]
+        base_trace = f"path=sku|{_trace_snip(sku_reason, 300)}"
         if not prod:
-            return "", "NOT FOUND", None
+            return "", "NOT FOUND", None, base_trace
     else:
-        return "", "NOT FOUND", None
+        if sk:
+            return (
+                "",
+                "NOT FOUND",
+                None,
+                f"path=sku|resolver_key_missing_from_batch|id={flags}",
+            )
+        return "", "NOT FOUND", None, f"path=no_keys|id={flags}"
 
     keepa_title = prod.get("title")
     keepa_brand = None
@@ -262,9 +307,9 @@ def _resolved_asin_confidence_product(
             keepa_brand = v.strip()
             break
 
-    ok_title, title_score, _ = validate_title_match(sheet_title, keepa_title)
-    ok_brand, _bs, _ = validate_brand_match(sheet_brand, keepa_brand)
-    pack_ok, _, _, _ = pack_consistency(sheet_title, keepa_title)
+    ok_title, title_score, title_why = validate_title_match(sheet_title, keepa_title)
+    ok_brand, brand_sc, brand_why = validate_brand_match(sheet_brand, keepa_brand)
+    pack_ok, _sp, _ap, pack_why = pack_consistency(sheet_title, keepa_title)
 
     if not pack_ok:
         row_status = "pack_mismatch"
@@ -281,7 +326,13 @@ def _resolved_asin_confidence_product(
         pack_ok=pack_ok,
     )
     ra = prod.get("asin")
-    return (str(ra) if ra else ""), conf, prod
+    match_tail = (
+        f"match|t_ok={int(ok_title)}|t_sc={title_score:.2f}|t={title_why}"
+        f"|b_ok={int(ok_brand)}|b_sc={brand_sc:.2f}|b={brand_why}"
+        f"|pk_ok={int(pack_ok)}|pk={pack_why}|conf={conf}"
+    )
+    full_trace = f"{base_trace}|{match_tail}"
+    return (str(ra) if ra else ""), conf, prod, _trace_snip(full_trace, 950)
 
 
 ProgressCb = Optional[Callable[[str, str, int, int], None]]
@@ -305,7 +356,7 @@ def run_process_pipeline(
     ollama_usage = OllamaTokenLedger()
 
     validate_queue: list[
-        tuple[dict[str, Any], dict[str, Any], str, str, dict[str, Any]]
+        tuple[dict[str, Any], dict[str, Any], str, str, dict[str, Any], str]
     ] = []
     do_llm_asin = bool(settings.use_ollama_asin_validate and use_ollama_asin_validate)
 
@@ -477,7 +528,7 @@ def run_process_pipeline(
             col_order = [
                 k for k in sheet_rows[0].keys() if isinstance(k, str) and not k.startswith("_")
             ]
-        headers, asin_h, conf_h = passthrough_headers(col_order)
+        headers, asin_h, conf_h, log_h = passthrough_headers(col_order)
         out_rows: list[dict[str, Any]] = []
         total_r = len(sheet_rows)
         for ri, row in enumerate(sheet_rows, start=1):
@@ -488,7 +539,7 @@ def run_process_pipeline(
                     ri,
                     max(total_r, 1),
                 )
-            ra, conf, prod = _resolved_asin_confidence_product(
+            ra, conf, prod, trace = _resolved_asin_confidence_product(
                 row,
                 keepa_products=keepa_products,
                 errors=errors,
@@ -498,6 +549,7 @@ def run_process_pipeline(
             line = {h: row.get(h) for h in col_order}
             line[asin_h] = ra
             line[conf_h] = conf
+            line[log_h] = trace
             out_rows.append(line)
             if (
                 do_llm_asin
@@ -505,7 +557,7 @@ def run_process_pipeline(
                 and prod
                 and str((row.get("_sheet_title_text") or "")).strip()
             ):
-                validate_queue.append((line, row, asin_h, conf_h, prod))
+                validate_queue.append((line, row, asin_h, conf_h, prod, log_h))
         sections.append((sheet_name, headers, out_rows))
 
     if validate_queue and do_llm_asin:
@@ -524,7 +576,16 @@ def run_process_pipeline(
             )
         else:
             label = "Haiku" if use_haiku_asin else "Ollama"
-            for i, (line, row, asin_h, conf_h, prod) in enumerate(validate_queue, start=1):
+            haiku_interval = float(settings.anthropic_asin_validate_min_interval_sec)
+            for i, (line, row, asin_h, conf_h, prod, log_h) in enumerate(
+                validate_queue, start=1
+            ):
+                if (
+                    use_haiku_asin
+                    and haiku_interval > 0
+                    and i > 1
+                ):
+                    time.sleep(haiku_interval)
                 p(
                     "ollama_asin",
                     f"{label} validates ASIN vs listing ({i} of {n_val})…",
@@ -576,7 +637,15 @@ def run_process_pipeline(
                 if verdict == "reject":
                     line[asin_h] = ""
                     line[conf_h] = "NOT FOUND (LLM)"
+                    line[log_h] = _append_trace(
+                        str(line.get(log_h) or ""),
+                        f"llm_reject({label})={_trace_snip(note or '', 320)}",
+                    )
                 elif verdict == "error":
+                    line[log_h] = _append_trace(
+                        str(line.get(log_h) or ""),
+                        f"llm_inconclusive({label})={_trace_snip(note or '', 320)}",
+                    )
                     logger.debug(
                         "%s ASIN validate inconclusive asin=%s note=%s",
                         label,
@@ -709,7 +778,7 @@ async def process_sheet(
     file: UploadFile = File(...),
     use_ollama: bool = False,
     use_ollama_asin_validate: bool = False,
-    max_rows: int = 500,
+    max_rows: int = 10_000,
 ) -> StreamingResponse:
     if not settings.keepa_api_key.strip():
         raise HTTPException(500, "KEEPA_API_KEY is not configured in .env")
@@ -748,7 +817,7 @@ async def process_start(
     file: UploadFile = File(...),
     use_ollama: bool = False,
     use_ollama_asin_validate: bool = False,
-    max_rows: int = 500,
+    max_rows: int = 10_000,
 ) -> dict[str, str]:
     if not settings.keepa_api_key.strip():
         raise HTTPException(500, "KEEPA_API_KEY is not configured in .env")

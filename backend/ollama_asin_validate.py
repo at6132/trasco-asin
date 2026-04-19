@@ -7,8 +7,12 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+import time
 from collections import defaultdict
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Literal, Optional
 
 import httpx
@@ -21,6 +25,39 @@ logger = logging.getLogger(__name__)
 ALLOWED_KEEPA_DOMAINS: frozenset[int] = frozenset({1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12})
 
 Verdict = Literal["accept", "reject", "error"]
+
+# Anthropic org limits (e.g. 50 RPM) — transient; we retry after a computed wait.
+_DEFAULT_ANTHROPIC_RATE_LIMIT_RETRIES = 12
+
+
+def _parse_retry_after_header(resp: httpx.Response) -> Optional[float]:
+    """Seconds to wait from ``Retry-After`` (seconds or HTTP-date), capped for safety."""
+    raw = (resp.headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        sec = float(raw)
+        if sec >= 0:
+            return min(120.0, sec)
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = (dt - datetime.now(timezone.utc)).total_seconds()
+            if delta > 0:
+                return min(120.0, delta)
+    except Exception:
+        pass
+    return None
+
+
+def _backoff_after_rate_limit(attempt: int) -> float:
+    """Exponential backoff with jitter when the API does not send Retry-After."""
+    base = min(90.0, 2.0 * (1.55 ** max(0, attempt - 1)))
+    return base + random.uniform(0.15, 1.1)
 
 
 def ollama_tags_reachable(base_url: str, timeout: float = 3.0) -> bool:
@@ -39,8 +76,13 @@ def _anthropic_first_message_text(
     *,
     max_tokens: int,
     timeout: float,
+    max_rate_limit_retries: int = _DEFAULT_ANTHROPIC_RATE_LIMIT_RETRIES,
 ) -> str:
-    """POST /v1/messages and concatenate assistant text blocks."""
+    """POST /v1/messages and concatenate assistant text blocks.
+
+    On HTTP 429 (rate limit) or 529 (overloaded), waits and retries using ``Retry-After`` when
+    present, otherwise exponential backoff, up to ``max_rate_limit_retries`` attempts.
+    """
     url = "https://api.anthropic.com/v1/messages"
     body = {
         "model": model or "claude-haiku-4-5-20251001",
@@ -52,12 +94,34 @@ def _anthropic_first_message_text(
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    with httpx.Client(timeout=timeout) as client:
-        r = client.post(url, json=body, headers=headers)
-        if r.status_code >= 400:
-            snippet = (r.text or "").strip().replace("\n", " ")[:400]
-            raise RuntimeError(f"anthropic_http_{r.status_code}:{snippet or r.reason_phrase}")
-        data = r.json()
+    attempt = 0
+    data: dict[str, Any] = {}
+    while True:
+        attempt += 1
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(url, json=body, headers=headers)
+        if r.status_code < 400:
+            data = r.json()
+            break
+        snippet = (r.text or "").strip().replace("\n", " ")[:400]
+        transient = r.status_code == 429 or r.status_code == 529
+        if transient and attempt <= max_rate_limit_retries:
+            wait = _parse_retry_after_header(r)
+            if wait is None:
+                wait = _backoff_after_rate_limit(attempt)
+            else:
+                wait = max(0.5, wait)
+            logger.warning(
+                "Anthropic HTTP %s — waiting %.1fs before retry %s/%s: %s",
+                r.status_code,
+                wait,
+                attempt,
+                max_rate_limit_retries,
+                snippet[:200],
+            )
+            time.sleep(wait)
+            continue
+        raise RuntimeError(f"anthropic_http_{r.status_code}:{snippet or r.reason_phrase}")
     text = ""
     for block in data.get("content") or []:
         if isinstance(block, dict) and block.get("type") == "text":

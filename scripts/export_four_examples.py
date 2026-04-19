@@ -33,7 +33,7 @@ def main() -> None:
             with open(p, "rb") as fp:
                 r = client.post(
                     "/api/v1/process",
-                    params={"use_ollama": "false", "max_rows": 500},
+                    params={"use_ollama": "false"},
                     files={
                         "file": (
                             p.name,

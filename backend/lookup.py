@@ -7,10 +7,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional
 
 import httpx
@@ -64,6 +67,83 @@ DOMAIN_BR = 12
 
 class KeepaError(Exception):
     pass
+
+
+_KEEPA_RATE_LIMIT_MAX_RETRIES = 12
+
+
+def _parse_retry_after_seconds(resp: httpx.Response) -> Optional[float]:
+    """Parse ``Retry-After`` (seconds or HTTP-date); cap for safety."""
+    raw = (resp.headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        sec = float(raw)
+        if sec >= 0:
+            return min(120.0, sec)
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = (dt - datetime.now(timezone.utc)).total_seconds()
+            if delta > 0:
+                return min(120.0, delta)
+    except Exception:
+        pass
+    return None
+
+
+def _keepa_backoff_after_rate_limit(attempt: int) -> float:
+    base = min(90.0, 2.0 * (1.55 ** max(0, attempt - 1)))
+    return base + random.uniform(0.15, 1.1)
+
+
+def _keepa_get_json(
+    client: httpx.Client,
+    url: str,
+    params: dict[str, Any],
+    *,
+    context: str,
+    max_retries: int = _KEEPA_RATE_LIMIT_MAX_RETRIES,
+) -> dict[str, Any]:
+    """
+    GET JSON from Keepa; on 429 (rate limit) or 503 (overload), wait and retry.
+    Uses ``Retry-After`` when present, else exponential backoff.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        r = client.get(url, params=params)
+        transient = r.status_code == 429 or r.status_code == 503
+        if transient:
+            if attempt > max_retries:
+                snippet = (r.text or "").strip().replace("\n", " ")[:400]
+                raise KeepaError(
+                    f"HTTP {r.status_code} after {max_retries} retries ({context}): {snippet}"
+                )
+            wait = _parse_retry_after_seconds(r)
+            if wait is None:
+                wait = _keepa_backoff_after_rate_limit(attempt)
+            else:
+                wait = max(0.5, min(120.0, wait))
+            log.warning(
+                "Keepa HTTP %s — waiting %.1fs before retry %s/%s (%s)",
+                r.status_code,
+                wait,
+                attempt,
+                max_retries,
+                context,
+            )
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            raise KeepaError(f"Keepa response was not a JSON object ({context})")
+        return data
 
 
 class KeepaThrottle:

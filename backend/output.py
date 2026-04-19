@@ -1,5 +1,6 @@
 """
-Excel output: preserve source columns + appended ASIN / confidence only (optional multi-sheet).
+Excel output: preserve source columns + appended ASIN, confidence, and optional trace column
+(optional multi-sheet).
 """
 
 from __future__ import annotations
@@ -31,9 +32,10 @@ def _autosize_columns(ws: Any, col_count: int, max_width: int = 60) -> None:
         ws.column_dimensions[letter].width = best
 
 
-def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str]:
+def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str, str]:
     """
-    Original column order unchanged; return (full_row_headers, asin_header, confidence_header).
+    Original column order unchanged; return
+    (full_row_headers, asin_header, confidence_header, trace_header).
     If the sheet already uses those names, pick non-colliding append names.
     """
     lower = {str(h).strip().lower() for h in col_order if h}
@@ -43,8 +45,13 @@ def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str]:
     conf_h = "confidence"
     if conf_h.lower() in lower:
         conf_h = "Trasco confidence"
-    full = list(col_order) + [asin_h, conf_h]
-    return full, asin_h, conf_h
+    log_h = "Trasco trace"
+    if log_h.lower() in lower:
+        log_h = "Trasco diagnostics"
+    if log_h.lower() in lower:
+        log_h = "_trasco_trace"
+    full = list(col_order) + [asin_h, conf_h, log_h]
+    return full, asin_h, conf_h, log_h
 
 
 def workbook_from_sheet_sections(
