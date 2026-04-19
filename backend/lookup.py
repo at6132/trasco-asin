@@ -207,17 +207,12 @@ def fetch_keepa_product(
         "history": history,
     }
     with httpx.Client(timeout=timeout) as client:
-        data: Optional[dict[str, Any]] = None
-        for attempt in range(6):
-            r = client.get(KEEPA_PRODUCT_URL, params=params)
-            if r.status_code == 429:
-                time.sleep(2.0 + attempt * 0.5)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            break
-        if not isinstance(data, dict):
-            raise KeepaError("Keepa product request failed after retries")
+        data = _keepa_get_json(
+            client,
+            KEEPA_PRODUCT_URL,
+            params,
+            context=f"product asin={asin} domain={domain}",
+        )
 
     _raise_if_error(data)
     if on_response:
@@ -288,17 +283,12 @@ def fetch_keepa_products_batch(
             "history": history,
         }
         with httpx.Client(timeout=timeout) as client:
-            data: Optional[dict[str, Any]] = None
-            for attempt in range(6):
-                r = client.get(KEEPA_PRODUCT_URL, params=params)
-                if r.status_code == 429:
-                    time.sleep(2.0 + attempt * 0.5)
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                break
-            if not isinstance(data, dict):
-                raise KeepaError("Keepa batch product request failed after retries")
+            data = _keepa_get_json(
+                client,
+                KEEPA_PRODUCT_URL,
+                params,
+                context=f"batch_product domain={domain} chunk={len(chunk)}",
+            )
 
         _raise_if_error(data)
         if on_response:
@@ -365,17 +355,12 @@ def fetch_keepa_product_by_code(
         "history": history,
     }
     with httpx.Client(timeout=timeout) as client:
-        data: Optional[dict[str, Any]] = None
-        for attempt in range(6):
-            r = client.get(KEEPA_PRODUCT_URL, params=params)
-            if r.status_code == 429:
-                time.sleep(2.0 + attempt * 0.5)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            break
-        if not isinstance(data, dict):
-            raise KeepaError("Keepa code request failed after retries")
+        data = _keepa_get_json(
+            client,
+            KEEPA_PRODUCT_URL,
+            params,
+            context=f"product_by_code domain={domain} code={digits}",
+        )
 
     _raise_if_error(data)
     if on_response:
@@ -424,17 +409,12 @@ def product_finder_asins(
         "selection": json.dumps(sel, separators=(",", ":")),
     }
     with httpx.Client(timeout=timeout) as client:
-        data: Optional[dict[str, Any]] = None
-        for attempt in range(6):
-            r = client.get(KEEPA_QUERY_URL, params=payload)
-            if r.status_code == 429:
-                time.sleep(2.0 + attempt * 0.5)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            break
-        if not isinstance(data, dict):
-            raise KeepaError("Keepa product_finder request failed after retries")
+        data = _keepa_get_json(
+            client,
+            KEEPA_QUERY_URL,
+            payload,
+            context=f"product_finder domain={domain}",
+        )
 
     _raise_if_error(data)
     if on_response:
