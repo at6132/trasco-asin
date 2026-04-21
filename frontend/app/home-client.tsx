@@ -10,7 +10,6 @@ function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_BASE?.replace(/\/$/, "") || defaultApi;
 }
 
-/** When true, API may use Ollama for parse / sheet-domain; ASIN double-check uses Haiku whenever `ANTHROPIC_API_KEY` is set. */
 function useOllamaQueryFlags(): boolean {
   return process.env.NEXT_PUBLIC_USE_OLLAMA === "true";
 }
@@ -23,6 +22,8 @@ type ProcessStatus = {
   total: number;
   error?: string | null;
   duration_sec?: number;
+  row_count?: number;
+  elapsed_sec?: number;
   ollama_prompt_tokens?: number;
   ollama_completion_tokens?: number;
   ollama_total_tokens?: number;
@@ -41,16 +42,53 @@ type CompletionSummary = {
 };
 
 function formatDuration(sec: number): string {
-  if (!Number.isFinite(sec) || sec < 0) return "—";
+  if (!Number.isFinite(sec) || sec < 0) return "\u2014";
   if (sec < 60) return `${sec.toFixed(1)} s`;
   const m = Math.floor(sec / 60);
   const s = sec - m * 60;
   return `${m}m ${s < 10 ? s.toFixed(1) : Math.round(s)}s`;
 }
 
-const ProcessHistoryPanel = dynamic(() => import("./ProcessHistoryPanel"), { ssr: false });
+function formatEta(sec: number): string {
+  if (!Number.isFinite(sec) || sec <= 0) return "";
+  if (sec < 60) return `~${Math.ceil(sec)}s remaining`;
+  const m = Math.ceil(sec / 60);
+  return `~${m} min remaining`;
+}
+
+const ProcessHistoryPanel = dynamic(
+  () => import("./ProcessHistoryPanel"),
+  { ssr: false },
+);
 
 const FILE_ACCEPT = ".xlsx,.xlsm,.csv";
+
+const ACTIVE_JOB_KEY = "trasco_active_job";
+
+type SavedJob = { jobId: string; filename: string; startedAt: number };
+
+function saveActiveJob(jobId: string, filename: string): void {
+  try {
+    const val: SavedJob = { jobId, filename, startedAt: Date.now() };
+    localStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify(val));
+  } catch {}
+}
+
+function loadActiveJob(): SavedJob | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_JOB_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj.jobId === "string") return obj as SavedJob;
+  } catch {}
+  return null;
+}
+
+function clearActiveJob(): void {
+  try {
+    localStorage.removeItem(ACTIVE_JOB_KEY);
+  } catch {}
+}
 
 const PHASE_ORDER = [
   "parse",
@@ -81,16 +119,57 @@ const PHASE_USER: Record<string, string> = {
 };
 
 function phaseUserLabel(phase: string): string {
-  return PHASE_USER[phase] ?? "Working…";
+  return PHASE_USER[phase] ?? "Working\u2026";
+}
+
+function buildSummary(
+  s: ProcessStatus,
+  filenameFallback: string,
+): { outName: string; summary: CompletionSummary } {
+  const serverName =
+    typeof s.download_name === "string" && s.download_name.trim()
+      ? s.download_name.trim()
+      : `${filenameFallback}_trasco_results.xlsx`;
+  const outName = serverName.endsWith(".xlsx")
+    ? serverName
+    : `${serverName}.xlsx`;
+  return {
+    outName,
+    summary: {
+      downloadName: outName,
+      durationSec: Number(s.duration_sec) || 0,
+      ollamaTotalTokens: Number(s.ollama_total_tokens) || 0,
+      ollamaPromptTokens: Number(s.ollama_prompt_tokens) || 0,
+      ollamaCompletionTokens: Number(s.ollama_completion_tokens) || 0,
+      ollamaRequests: Number(s.ollama_requests) || 0,
+    },
+  };
+}
+
+async function downloadResult(jobId: string, outName: string): Promise<void> {
+  const fileR = await fetch(`${apiBase()}/api/v1/process/result/${jobId}`);
+  if (!fileR.ok) throw new Error((await fileR.text()) || fileR.statusText);
+  const blob = await fileR.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = outName;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export default function HomeClient() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [processProgress, setProcessProgress] = useState<ProcessStatus | null>(null);
-  const [completionSummary, setCompletionSummary] = useState<CompletionSummary | null>(null);
+  const [processProgress, setProcessProgress] = useState<ProcessStatus | null>(
+    null,
+  );
+  const [completionSummary, setCompletionSummary] =
+    useState<CompletionSummary | null>(null);
+  const [comebackReady, setComebackReady] =
+    useState<CompletionSummary | null>(null);
+  const [comebackJobId, setComebackJobId] = useState<string | null>(null);
   const [historyRefreshTick, setHistoryRefreshTick] = useState(0);
-  /** Bumps after a successful run so the file picker remounts with an empty selection. */
   const [runConsoleKey, setRunConsoleKey] = useState(0);
   const cancelledRef = useRef(false);
 
@@ -101,103 +180,142 @@ export default function HomeClient() {
     };
   }, []);
 
-  const onProcess = useCallback(async (file: File | null) => {
-      setError(null);
-      if (!file) {
-        setError("Choose an Excel or CSV file first.");
-        return;
-      }
+  const pollJob = useCallback(
+    async (jobId: string, filenameFallback: string, isResume: boolean) => {
       setBusy("process");
-      setProcessProgress({
-        status: "queued",
-        phase: "queued",
-        message: "Starting…",
-        current: 0,
-        total: 0,
-      });
-      const base = file.name.replace(/\.[^.]+$/, "");
-      const pollMs = 380;
-      try {
-        const fd = new FormData();
-        fd.append("file", file);
-        const q = new URLSearchParams();
-        const ollama = useOllamaQueryFlags();
-        // use_ollama: Gemma for parse/sheet-domain paths only. use_ollama_asin_validate: LLM ASIN double-check (Haiku on API when ANTHROPIC_API_KEY, else Gemma).
-        q.set("use_ollama", ollama ? "true" : "false");
-        q.set("use_ollama_asin_validate", "true");
-        const startR = await fetch(`${apiBase()}/api/v1/process/start?${q.toString()}`, {
-          method: "POST",
-          body: fd,
+      if (!isResume) {
+        setProcessProgress({
+          status: "queued",
+          phase: "queued",
+          message: "Starting\u2026",
+          current: 0,
+          total: 0,
         });
-        if (!startR.ok) {
-          const t = await startR.text();
-          setError(t || startR.statusText);
-          return;
-        }
-        const startBody = (await startR.json()) as { job_id?: string };
-        const jobId = startBody.job_id;
-        if (!jobId || typeof jobId !== "string") {
-          setError("Couldn’t start. Try again.");
-          return;
-        }
-
-        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      }
+      const pollMs = 400;
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      try {
         let firstPoll = true;
-
         while (!cancelledRef.current) {
           if (!firstPoll) await sleep(pollMs);
           firstPoll = false;
           if (cancelledRef.current) break;
-          const sR = await fetch(`${apiBase()}/api/v1/process/status/${jobId}`);
+          const sR = await fetch(
+            `${apiBase()}/api/v1/process/status/${jobId}`,
+          );
           if (!sR.ok) {
-            setError((await sR.text()) || sR.statusText);
+            clearActiveJob();
+            if (sR.status === 404) {
+              setError("Job expired. Please re-upload your file.");
+            } else {
+              setError((await sR.text()) || sR.statusText);
+            }
             return;
           }
           const s = (await sR.json()) as ProcessStatus;
           setProcessProgress(s);
           if (s.status === "error") {
+            clearActiveJob();
             setError(s.error || s.message || "Process failed.");
             return;
           }
           if (s.status === "complete") {
-            const fileR = await fetch(`${apiBase()}/api/v1/process/result/${jobId}`);
-            if (!fileR.ok) {
-              const t = await fileR.text();
-              setError(t || fileR.statusText);
-              return;
+            clearActiveJob();
+            const { outName, summary } = buildSummary(s, filenameFallback);
+            if (isResume) {
+              setComebackReady(summary);
+              setComebackJobId(jobId);
+            } else {
+              await downloadResult(jobId, outName);
+              setCompletionSummary(summary);
             }
-            const blob = await fileR.blob();
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            const serverName =
-              typeof s.download_name === "string" && s.download_name.trim()
-                ? s.download_name.trim()
-                : `${base}_trasco_results.xlsx`;
-            const outName = serverName.endsWith(".xlsx") ? serverName : `${serverName}.xlsx`;
-            a.download = outName;
-            a.click();
-            URL.revokeObjectURL(url);
-            setCompletionSummary({
-              downloadName: outName,
-              durationSec: Number(s.duration_sec) || 0,
-              ollamaTotalTokens: Number(s.ollama_total_tokens) || 0,
-              ollamaPromptTokens: Number(s.ollama_prompt_tokens) || 0,
-              ollamaCompletionTokens: Number(s.ollama_completion_tokens) || 0,
-              ollamaRequests: Number(s.ollama_requests) || 0,
-            });
             setRunConsoleKey((k) => k + 1);
             setHistoryRefreshTick((n) => n + 1);
             return;
           }
         }
       } catch (e) {
+        clearActiveJob();
         setError(e instanceof Error ? e.message : String(e));
       } finally {
         setBusy(null);
         setProcessProgress(null);
       }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const saved = loadActiveJob();
+    if (!saved) return;
+    (async () => {
+      try {
+        const sR = await fetch(
+          `${apiBase()}/api/v1/process/status/${saved.jobId}`,
+        );
+        if (!sR.ok) {
+          clearActiveJob();
+          return;
+        }
+        const s = (await sR.json()) as ProcessStatus;
+        const base = saved.filename.replace(/\.[^.]+$/, "");
+        if (s.status === "complete") {
+          clearActiveJob();
+          const { summary } = buildSummary(s, base);
+          setComebackReady(summary);
+          setComebackJobId(saved.jobId);
+          setHistoryRefreshTick((n) => n + 1);
+          return;
+        }
+        if (s.status === "error") {
+          clearActiveJob();
+          return;
+        }
+        pollJob(saved.jobId, base, true);
+      } catch {
+        clearActiveJob();
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const onProcess = useCallback(
+    async (file: File | null) => {
+      setError(null);
+      if (!file) {
+        setError("Choose an Excel or CSV file first.");
+        return;
+      }
+      const fd = new FormData();
+      fd.append("file", file);
+      const q = new URLSearchParams();
+      const ollama = useOllamaQueryFlags();
+      q.set("use_ollama", ollama ? "true" : "false");
+      q.set("use_ollama_asin_validate", "true");
+      try {
+        const startR = await fetch(
+          `${apiBase()}/api/v1/process/start?${q.toString()}`,
+          { method: "POST", body: fd },
+        );
+        if (!startR.ok) {
+          setError((await startR.text()) || startR.statusText);
+          return;
+        }
+        const startBody = (await startR.json()) as { job_id?: string };
+        const jobId = startBody.job_id;
+        if (!jobId || typeof jobId !== "string") {
+          setError("Couldn't start. Try again.");
+          return;
+        }
+        saveActiveJob(jobId, file.name);
+        const base = file.name.replace(/\.[^.]+$/, "");
+        pollJob(jobId, base, false);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [pollJob],
+  );
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-[#020617] text-zinc-100">
@@ -240,7 +358,7 @@ export default function HomeClient() {
             </div>
             <div>
               <h1 className="bg-gradient-to-r from-white via-cyan-100 to-cyan-300 bg-clip-text text-3xl font-bold tracking-tight text-transparent md:text-4xl">
-                Sheet → ASINs
+                Sheet &rarr; ASINs
               </h1>
             </div>
           </div>
@@ -284,6 +402,26 @@ export default function HomeClient() {
         <CompletionModal
           summary={completionSummary}
           onClose={() => setCompletionSummary(null)}
+        />
+      ) : null}
+
+      {comebackReady ? (
+        <ComebackModal
+          summary={comebackReady}
+          jobId={comebackJobId!}
+          onDownload={async () => {
+            try {
+              await downloadResult(comebackJobId!, comebackReady.downloadName);
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e));
+            }
+            setComebackReady(null);
+            setComebackJobId(null);
+          }}
+          onDismiss={() => {
+            setComebackReady(null);
+            setComebackJobId(null);
+          }}
         />
       ) : null}
     </div>
@@ -339,7 +477,7 @@ function RunConsole(props: {
               className="absolute right-3 top-3 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-slate-900/90 text-lg font-light leading-none text-zinc-300 shadow-lg backdrop-blur-sm transition hover:border-red-400/50 hover:bg-red-950/50 hover:text-red-200"
               aria-label="Clear selected file"
             >
-              ×
+              &times;
             </button>
           ) : null}
         </div>
@@ -360,7 +498,7 @@ function RunConsole(props: {
           {props.busy ? (
             <>
               <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-900/30 border-t-slate-900" />
-              Working…
+              Working&hellip;
             </>
           ) : (
             <>Run</>
@@ -383,13 +521,28 @@ function ProcessProgressDeck(props: { status: ProcessStatus }) {
   const isDone = status.phase === "done";
   const phaseLabel = phaseUserLabel(status.phase);
 
+  const elapsed = Number(status.elapsed_sec) || 0;
+  const rowCount = Number(status.row_count) || 0;
+  let etaText = "";
+  if (!isDone && rowCount > 0 && elapsed > 5) {
+    const secPerRow = 1.2;
+    const estimatedTotal = rowCount * secPerRow;
+    const remaining = Math.max(0, estimatedTotal - elapsed);
+    etaText = formatEta(remaining);
+  }
+
   return (
     <section
       className="rounded-2xl border border-cyan-500/20 bg-slate-950/60 p-5 backdrop-blur-md md:p-6"
       aria-live="polite"
       aria-busy={status.status !== "complete" && status.status !== "error"}
     >
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between">
+        {etaText ? (
+          <span className="text-xs text-zinc-500">{etaText}</span>
+        ) : (
+          <span />
+        )}
         <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-200">
           {phaseLabel}
         </span>
@@ -440,13 +593,20 @@ function ProcessProgressDeck(props: { status: ProcessStatus }) {
           </span>
         ) : null}
       </div>
+      {elapsed > 0 && !isDone ? (
+        <p className="mt-2 text-right text-[11px] tabular-nums text-zinc-600">
+          {formatDuration(elapsed)} elapsed
+        </p>
+      ) : null}
     </section>
   );
 }
 
-function CompletionModal(props: { summary: CompletionSummary; onClose: () => void }) {
+function CompletionModal(props: {
+  summary: CompletionSummary;
+  onClose: () => void;
+}) {
   const { summary, onClose } = props;
-
   return (
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4 backdrop-blur-md"
@@ -456,12 +616,18 @@ function CompletionModal(props: { summary: CompletionSummary; onClose: () => voi
     >
       <div className="trasco-modal-panel relative w-full max-w-md overflow-hidden rounded-3xl border border-cyan-500/30 bg-slate-950/90 p-8 shadow-[0_0_60px_-10px_rgba(0,212,255,0.4)]">
         <div className="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-cyan-500/20 blur-3xl" />
-        <h2 id="completion-title" className="relative text-xl font-bold text-white">
+        <h2
+          id="completion-title"
+          className="relative text-xl font-bold text-white"
+        >
           Done
         </h2>
         <p className="relative mt-3 text-sm text-zinc-400">
           Saved{" "}
-          <span className="font-medium text-cyan-200/90">{summary.downloadName}</span> to your downloads.
+          <span className="font-medium text-cyan-200/90">
+            {summary.downloadName}
+          </span>{" "}
+          to your downloads.
         </p>
         <p className="relative mt-4 text-sm text-zinc-500">
           Took {formatDuration(summary.durationSec)}.
@@ -473,6 +639,61 @@ function CompletionModal(props: { summary: CompletionSummary; onClose: () => voi
         >
           OK
         </button>
+      </div>
+    </div>
+  );
+}
+
+function ComebackModal(props: {
+  summary: CompletionSummary;
+  jobId: string;
+  onDownload: () => void;
+  onDismiss: () => void;
+}) {
+  const { summary, onDownload, onDismiss } = props;
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4 backdrop-blur-md"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="comeback-title"
+    >
+      <div className="trasco-modal-panel relative w-full max-w-md overflow-hidden rounded-3xl border border-cyan-500/30 bg-slate-950/90 p-8 shadow-[0_0_60px_-10px_rgba(0,212,255,0.4)]">
+        <div className="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-cyan-500/20 blur-3xl" />
+        <h2
+          id="comeback-title"
+          className="relative text-xl font-bold text-white"
+        >
+          Your file is ready
+        </h2>
+        <p className="relative mt-3 text-sm text-zinc-400">
+          <span className="font-medium text-cyan-200/90">
+            {summary.downloadName}
+          </span>{" "}
+          completed while you were away.
+        </p>
+        <p className="relative mt-2 text-sm text-zinc-500">
+          Took {formatDuration(summary.durationSec)}.
+        </p>
+        <div className="relative mt-8 flex gap-3">
+          <button
+            type="button"
+            onClick={onDownload}
+            className="flex-1 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 py-3 text-sm font-semibold text-slate-950 transition hover:brightness-110"
+          >
+            Download
+          </button>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="flex-1 rounded-xl border border-white/15 bg-slate-900/80 py-3 text-sm font-medium text-zinc-300 transition hover:bg-slate-800/80"
+          >
+            Dismiss
+          </button>
+        </div>
+        <p className="relative mt-3 text-center text-[11px] text-zinc-600">
+          You can also re-download from Recent Runs below.
+        </p>
       </div>
     </div>
   );

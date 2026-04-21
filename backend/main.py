@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import threading
 import time
@@ -19,6 +20,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Callable, Optional
+
+from backend.rate_limiter import RpmLimiter
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +34,7 @@ from backend.lookup import (
     KeepaThrottle,
     fetch_keepa_product,
     fetch_keepa_product_by_code,
+    fetch_keepa_products_batch,
     first_product,
     best_product_by_title,
 )
@@ -339,6 +343,9 @@ ProgressCb = Optional[Callable[[str, str, int, int], None]]
 """phase, message, current (1-based step), total (0 = indeterminate bar)."""
 
 
+RowCountCb = Optional[Callable[[int], None]]
+
+
 def run_process_pipeline(
     data: bytes,
     filename: str,
@@ -347,6 +354,7 @@ def run_process_pipeline(
     max_rows: int,
     progress: ProgressCb,
     use_ollama_asin_validate: bool = True,
+    on_row_count: RowCountCb = None,
 ) -> tuple[BytesIO, str, dict[str, Any]]:
     def p(phase: str, message: str, current: int = 0, total: int = 0) -> None:
         if progress:
@@ -356,7 +364,7 @@ def run_process_pipeline(
     ollama_usage = OllamaTokenLedger()
 
     validate_queue: list[
-        tuple[dict[str, Any], dict[str, Any], str, str, dict[str, Any], str]
+        tuple[dict[str, Any], dict[str, Any], str, str, dict[str, Any], str, str]
     ] = []
     do_llm_asin = bool(settings.use_ollama_asin_validate and use_ollama_asin_validate)
 
@@ -376,6 +384,8 @@ def run_process_pipeline(
         raise RuntimeError(f"Failed to parse file: {e}") from e
 
     rows_in = parsed.rows[: max(1, min(max_rows, 10_000))]
+    if on_row_count:
+        on_row_count(len(rows_in))
     _upload_stem = (filename or "upload.xlsx").rsplit(".", 1)[0].strip()[:240]
     for _r in rows_in:
         _r["_source_file_hint"] = _upload_stem
@@ -423,39 +433,74 @@ def run_process_pipeline(
         if dk not in title_hint_for_key:
             title_hint_for_key[dk] = row.get("_sheet_title_text")
 
-    n_direct = len(unique_direct)
-    for i, dk in enumerate(unique_direct, start=1):
+    asin_direct_by_domain: dict[int, list[str]] = {}
+    code_direct: list[tuple[int, str, str]] = []
+    for dk in unique_direct:
         dom, kind, val = dk
-        label = "ASIN" if kind == "asin" else "GTIN/EAN"
+        if kind == "asin":
+            asin_direct_by_domain.setdefault(dom, []).append(val)
+        else:
+            code_direct.append(dk)
+
+    n_direct = len(unique_direct)
+    done_direct = 0
+
+    for dom, asin_list in asin_direct_by_domain.items():
         p(
             "keepa_direct",
-            f"Keepa ({label}) domain {dom} — {i} of {n_direct}…",
-            i,
+            f"Keepa ASIN batch domain {dom} — {len(asin_list)} ASINs…",
+            done_direct + 1,
             max(n_direct, 1),
         )
         try:
-            if kind == "asin":
-                payload = fetch_keepa_product(
-                    settings.keepa_api_key,
-                    val,
-                    dom,
-                    cache=cache,
-                    cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
-                    history=0,
-                    throttle=throttle,
-                )
-                prod = first_product(payload)
-            else:
-                payload = fetch_keepa_product_by_code(
-                    settings.keepa_api_key,
-                    val,
-                    dom,
-                    cache=cache,
-                    cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
-                    history=0,
-                    throttle=throttle,
-                )
-                prod = best_product_by_title(payload, title_hint_for_key.get(dk))
+            batch_result = fetch_keepa_products_batch(
+                settings.keepa_api_key,
+                asin_list,
+                dom,
+                cache=cache,
+                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                history=0,
+                throttle=throttle,
+            )
+            for asin_val in asin_list:
+                dk = (dom, "asin", asin_val)
+                prod = batch_result.get(asin_val.strip().upper())
+                if prod:
+                    keepa_products[dk] = prod
+                else:
+                    errors[dk] = "not_found"
+                done_direct += 1
+        except KeepaError as e:
+            for asin_val in asin_list:
+                dk = (dom, "asin", asin_val)
+                errors[dk] = str(e)
+                done_direct += 1
+        except Exception as e:
+            for asin_val in asin_list:
+                dk = (dom, "asin", asin_val)
+                errors[dk] = f"lookup_error:{e}"
+                done_direct += 1
+
+    for dk in code_direct:
+        dom, kind, val = dk
+        done_direct += 1
+        p(
+            "keepa_direct",
+            f"Keepa (GTIN/EAN) domain {dom} — {done_direct} of {n_direct}…",
+            done_direct,
+            max(n_direct, 1),
+        )
+        try:
+            payload = fetch_keepa_product_by_code(
+                settings.keepa_api_key,
+                val,
+                dom,
+                cache=cache,
+                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                history=0,
+                throttle=throttle,
+            )
+            prod = best_product_by_title(payload, title_hint_for_key.get(dk))
             if not prod:
                 errors[dk] = "not_found"
                 continue
@@ -528,7 +573,7 @@ def run_process_pipeline(
             col_order = [
                 k for k in sheet_rows[0].keys() if isinstance(k, str) and not k.startswith("_")
             ]
-        headers, asin_h, conf_h, log_h = passthrough_headers(col_order)
+        headers, asin_h, conf_h, log_h, reject_asin_h = passthrough_headers(col_order)
         out_rows: list[dict[str, Any]] = []
         total_r = len(sheet_rows)
         for ri, row in enumerate(sheet_rows, start=1):
@@ -550,6 +595,7 @@ def run_process_pipeline(
             line[asin_h] = ra
             line[conf_h] = conf
             line[log_h] = trace
+            line[reject_asin_h] = ""
             out_rows.append(line)
             if (
                 do_llm_asin
@@ -557,7 +603,9 @@ def run_process_pipeline(
                 and prod
                 and str((row.get("_sheet_title_text") or "")).strip()
             ):
-                validate_queue.append((line, row, asin_h, conf_h, prod, log_h))
+                validate_queue.append(
+                    (line, row, asin_h, conf_h, prod, log_h, reject_asin_h)
+                )
         sections.append((sheet_name, headers, out_rows))
 
     if validate_queue and do_llm_asin:
@@ -576,26 +624,24 @@ def run_process_pipeline(
             )
         else:
             label = "Haiku" if use_haiku_asin else "Ollama"
-            haiku_interval = float(settings.anthropic_asin_validate_min_interval_sec)
-            for i, (line, row, asin_h, conf_h, prod, log_h) in enumerate(
-                validate_queue, start=1
-            ):
-                if (
-                    use_haiku_asin
-                    and haiku_interval > 0
-                    and i > 1
-                ):
-                    time.sleep(haiku_interval)
-                p(
-                    "ollama_asin",
-                    f"{label} validates ASIN vs listing ({i} of {n_val})…",
-                    i,
-                    n_val,
-                )
+            haiku_rpm = RpmLimiter(requests_per_minute=45)
+            val_counter = [0]
+            val_lock = threading.Lock()
+
+            def _validate_one(
+                idx: int,
+                line: dict[str, Any],
+                row: dict[str, Any],
+                asin_h: str,
+                conf_h: str,
+                prod: dict[str, Any],
+                log_h: str,
+                reject_asin_h: str,
+            ) -> None:
                 desc = str((row.get("_sheet_title_text") or "")).strip()
                 ra0 = str(line.get(asin_h) or "").strip()
                 if not ra0:
-                    continue
+                    return
                 sku_raw = row.get("_sku")
                 sku_s = (
                     str(sku_raw).strip()
@@ -609,6 +655,9 @@ def run_process_pipeline(
                     if isinstance(v, str) and v.strip():
                         kb = v.strip()
                         break
+
+                haiku_rpm.acquire()
+
                 if use_haiku_asin:
                     verdict, note = haiku_validate_asin_vs_description(
                         settings.anthropic_api_key.strip(),
@@ -635,6 +684,7 @@ def run_process_pipeline(
                         timeout=tmo,
                     )
                 if verdict == "reject":
+                    line[reject_asin_h] = ra0
                     line[asin_h] = ""
                     line[conf_h] = "NOT FOUND (LLM)"
                     line[log_h] = _append_trace(
@@ -652,6 +702,26 @@ def run_process_pipeline(
                         ra0,
                         note,
                     )
+                with val_lock:
+                    val_counter[0] += 1
+                    done_n = val_counter[0]
+                p(
+                    "ollama_asin",
+                    f"{label} validates ASIN vs listing ({done_n} of {n_val})…",
+                    done_n,
+                    n_val,
+                )
+
+            n_workers = 4 if use_haiku_asin else 1
+            p("ollama_asin", f"{label} validating {n_val} ASINs ({n_workers} workers)…", 0, n_val)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futs = []
+                for i, (line, row, ah, ch, prod, lh, rh) in enumerate(validate_queue):
+                    futs.append(pool.submit(_validate_one, i, line, row, ah, ch, prod, lh, rh))
+                for fut in as_completed(futs):
+                    exc = fut.exception()
+                    if exc:
+                        logger.warning("LLM ASIN validate worker error: %s", exc)
 
     p("workbook", "Writing Excel workbook…", 0, 0)
     buf = workbook_from_sheet_sections(sections)
@@ -679,14 +749,31 @@ class ProcessJob:
     ollama_total_tokens: int = 0
     ollama_requests: int = 0
     source_filename: Optional[str] = None
+    started_at: float = field(default_factory=time.time)
+    row_count: int = 0
+    completed_at: Optional[float] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 _process_jobs: dict[str, ProcessJob] = {}
+_COMPLETED_JOB_TTL_SEC = 7200.0  # 2 hours
+
+
+def _purge_stale_jobs() -> None:
+    """Remove completed/errored jobs older than TTL from in-memory dict."""
+    now = time.time()
+    stale = [
+        jid
+        for jid, j in _process_jobs.items()
+        if j.completed_at is not None and (now - j.completed_at) > _COMPLETED_JOB_TTL_SEC
+    ]
+    for jid in stale:
+        _process_jobs.pop(jid, None)
 
 
 def _job_snapshot(job: ProcessJob) -> dict[str, Any]:
     with job.lock:
+        elapsed = round(time.time() - job.started_at, 1)
         snap: dict[str, Any] = {
             "status": job.status,
             "phase": job.phase,
@@ -694,6 +781,8 @@ def _job_snapshot(job: ProcessJob) -> dict[str, Any]:
             "current": job.current,
             "total": job.total,
             "error": job.error,
+            "row_count": job.row_count,
+            "elapsed_sec": elapsed,
         }
         if job.status == "complete":
             snap["duration_sec"] = job.duration_sec
@@ -726,6 +815,10 @@ async def _run_process_job(
             job.current = current
             job.total = total
 
+    def set_row_count(n: int) -> None:
+        with job.lock:
+            job.row_count = n
+
     try:
         buf, download_name, stats = await asyncio.to_thread(
             run_process_pipeline,
@@ -735,6 +828,7 @@ async def _run_process_job(
             max_rows=max_rows,
             progress=progress,
             use_ollama_asin_validate=use_ollama_asin_validate,
+            on_row_count=set_row_count,
         )
         xlsx_bytes = buf.getvalue()
         path = save_result_xlsx(job_id, xlsx_bytes)
@@ -760,6 +854,7 @@ async def _run_process_job(
             job.result_path = path
             job.download_name = download_name
             job.source_filename = filename
+            job.completed_at = time.time()
             job.duration_sec = float(stats.get("duration_sec") or 0)
             job.ollama_prompt_tokens = int(stats.get("ollama_prompt_tokens") or 0)
             job.ollama_completion_tokens = int(stats.get("ollama_completion_tokens") or 0)
@@ -771,6 +866,7 @@ async def _run_process_job(
             job.phase = "error"
             job.message = str(e)
             job.error = str(e)
+            job.completed_at = time.time()
 
 
 @app.post("/api/v1/process")
@@ -826,6 +922,7 @@ async def process_start(
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty file.")
+    _purge_stale_jobs()
     job_id = str(uuid.uuid4())
     job = ProcessJob(
         status="queued",
@@ -851,29 +948,59 @@ async def process_start(
 @app.get("/api/v1/process/status/{job_id}")
 def process_status(job_id: str) -> dict[str, Any]:
     job = _process_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(404, "Unknown job_id.")
-    return _job_snapshot(job)
+    if job is not None:
+        return _job_snapshot(job)
+    path = history_result_path(job_id)
+    if path is not None:
+        for entry in list_history(200):
+            if str(entry.get("job_id")) == job_id:
+                return {
+                    "status": "complete",
+                    "phase": "done",
+                    "message": "Ready to download.",
+                    "current": 1,
+                    "total": 1,
+                    "error": None,
+                    "row_count": 0,
+                    "elapsed_sec": 0,
+                    "duration_sec": float(entry.get("duration_sec") or 0),
+                    "source_filename": entry.get("source_filename"),
+                    "download_name": entry.get("download_name"),
+                }
+    raise HTTPException(404, "Unknown job_id.")
 
 
 @app.get("/api/v1/process/result/{job_id}")
 def process_result(job_id: str) -> FileResponse:
     job = _process_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(404, "Unknown job_id.")
-    with job.lock:
-        if job.status == "error":
-            raise HTTPException(400, job.error or "Job failed.")
-        if job.status != "complete" or not job.result_path:
-            raise HTTPException(409, "Job not finished yet.")
-        path = job.result_path
-        name = job.download_name or "trasco_results.xlsx"
-    del _process_jobs[job_id]
-    return FileResponse(
-        path,
-        filename=name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if job is not None:
+        with job.lock:
+            if job.status == "error":
+                raise HTTPException(400, job.error or "Job failed.")
+            if job.status != "complete" or not job.result_path:
+                raise HTTPException(409, "Job not finished yet.")
+            path = job.result_path
+            name = job.download_name or "trasco_results.xlsx"
+        return FileResponse(
+            path,
+            filename=name,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    hist_path = history_result_path(job_id)
+    if hist_path is not None:
+        name = "trasco_results.xlsx"
+        for entry in list_history(200):
+            if str(entry.get("job_id")) == job_id:
+                dn = entry.get("download_name")
+                if isinstance(dn, str) and dn.strip():
+                    name = dn.strip()
+                break
+        return FileResponse(
+            str(hist_path),
+            filename=name,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    raise HTTPException(404, "Unknown job_id.")
 
 
 @app.get("/api/v1/process/history")

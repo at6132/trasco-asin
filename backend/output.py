@@ -32,11 +32,12 @@ def _autosize_columns(ws: Any, col_count: int, max_width: int = 60) -> None:
         ws.column_dimensions[letter].width = best
 
 
-def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str, str]:
+def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str, str, str]:
     """
     Original column order unchanged; return
-    (full_row_headers, asin_header, confidence_header, trace_header).
+    (full_row_headers, asin_header, confidence_header, trace_header, rejected_asin_header).
     If the sheet already uses those names, pick non-colliding append names.
+    ``rejected_asin_header`` is filled when LLM ASIN validation rejects (else empty).
     """
     lower = {str(h).strip().lower() for h in col_order if h}
     asin_h = "ASIN"
@@ -50,8 +51,13 @@ def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str, str]
         log_h = "Trasco diagnostics"
     if log_h.lower() in lower:
         log_h = "_trasco_trace"
-    full = list(col_order) + [asin_h, conf_h, log_h]
-    return full, asin_h, conf_h, log_h
+    rej_h = "Rejected ASIN (LLM)"
+    if rej_h.lower() in lower:
+        rej_h = "Trasco rejected ASIN"
+    if rej_h.lower() in lower:
+        rej_h = "_trasco_llm_rejected_asin"
+    full = list(col_order) + [asin_h, conf_h, log_h, rej_h]
+    return full, asin_h, conf_h, log_h, rej_h
 
 
 def workbook_from_sheet_sections(
