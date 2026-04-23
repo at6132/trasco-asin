@@ -2,7 +2,13 @@
 
 import dynamic from "next/dynamic";
 import Image from "next/image";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 const defaultApi = "http://127.0.0.1:8000";
 
@@ -108,6 +114,309 @@ type QueueStats = {
 };
 
 const QUEUE_POLL_MS = 4000;
+
+function MetricCard(props: {
+  title: string;
+  accent: "cyan" | "emerald" | "violet" | "amber" | "sky";
+  children: ReactNode;
+  compact?: boolean;
+}) {
+  const ring: Record<string, string> = {
+    cyan: "border-cyan-500/25 shadow-[0_0_24px_-8px_rgba(0,212,255,0.25)]",
+    emerald: "border-emerald-500/25 shadow-[0_0_24px_-8px_rgba(52,211,153,0.2)]",
+    violet: "border-violet-500/25 shadow-[0_0_24px_-8px_rgba(167,139,250,0.2)]",
+    amber: "border-amber-400/35 shadow-[0_0_24px_-8px_rgba(251,191,36,0.15)]",
+    sky: "border-sky-500/25 shadow-[0_0_24px_-8px_rgba(56,189,248,0.2)]",
+  };
+  const dot: Record<string, string> = {
+    cyan: "bg-cyan-400",
+    emerald: "bg-emerald-400",
+    violet: "bg-violet-400",
+    amber: "bg-amber-400",
+    sky: "bg-sky-400",
+  };
+  return (
+    <div
+      className={`rounded-xl border bg-slate-950/70 p-3 backdrop-blur-sm ${ring[props.accent]} ${
+        props.compact ? "p-2.5" : ""
+      }`}
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <span
+          className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot[props.accent]} shadow-[0_0_8px_currentColor]`}
+          aria-hidden
+        />
+        <h3 className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+          {props.title}
+        </h3>
+      </div>
+      <div className="space-y-1.5 text-[12px] leading-snug text-zinc-300">{props.children}</div>
+    </div>
+  );
+}
+
+function ProcessingDashboard(props: {
+  status: ProcessStatus;
+  queueStats: QueueStats | null;
+  queueFetchError: boolean;
+}) {
+  const { status, queueStats, queueFetchError } = props;
+  const indeterminate = status.total <= 0;
+  const pct =
+    status.total > 0
+      ? Math.min(100, Math.round((status.current / status.total) * 100))
+      : 0;
+  const activeIdx = phaseIndex(status.phase);
+  const isDone = status.phase === "done";
+  const phaseLabel = phaseUserLabel(status.phase);
+  const elapsed = Number(status.elapsed_sec) || 0;
+  const rowCount = Number(status.row_count) || 0;
+  let etaText = "";
+  if (!isDone && rowCount > 0 && elapsed > 5) {
+    const secPerRow = 1.2;
+    const estimatedTotal = rowCount * secPerRow;
+    const remaining = Math.max(0, estimatedTotal - elapsed);
+    etaText = formatEta(remaining);
+  }
+
+  const aReq = Number(status.anthropic_requests) || 0;
+  const aIn = Number(status.anthropic_input_tokens) || 0;
+  const aOut = Number(status.anthropic_output_tokens) || 0;
+  const aTotal = Number(status.anthropic_total_tokens) || aIn + aOut;
+  const secForClaude = isDone ? Math.max(elapsed, 0.001) : Math.max(elapsed, 5);
+  const claudeRpm =
+    aReq > 0 ? Math.round(((aReq * 60) / secForClaude) * 10) / 10 : 0;
+
+  const oReq = Number(status.ollama_requests) || 0;
+  const oIn = Number(status.ollama_prompt_tokens) || 0;
+  const oOut = Number(status.ollama_completion_tokens) || 0;
+  const oTotal = Number(status.ollama_total_tokens) || oIn + oOut;
+  const showOllama = oReq > 0 || oTotal > 0;
+
+  const multi =
+    queueStats !== null &&
+    queueStats.active > 1 &&
+    !queueFetchError;
+
+  return (
+    <section
+      className="mt-8 overflow-hidden rounded-2xl border border-cyan-500/30 bg-gradient-to-b from-slate-900/90 via-slate-950/95 to-slate-950/90 shadow-[0_0_48px_-12px_rgba(0,212,255,0.35)] backdrop-blur-xl"
+      aria-label="Live run monitor"
+      aria-live="polite"
+      aria-busy={status.status !== "complete" && status.status !== "error"}
+    >
+      <div className="border-b border-white/10 bg-gradient-to-r from-cyan-500/10 via-transparent to-violet-500/10 px-4 py-3 md:px-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-400/80">
+              Live monitor
+            </p>
+            <p className="mt-0.5 max-w-xl text-xs text-zinc-500">
+              {status.message ? (
+                <span className="text-zinc-400">{status.message}</span>
+              ) : (
+                "Pipeline activity for this upload."
+              )}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {etaText ? (
+              <span className="rounded-lg border border-white/10 bg-slate-900/80 px-2.5 py-1 text-[11px] tabular-nums text-zinc-400">
+                {etaText}
+              </span>
+            ) : null}
+            <span className="rounded-full border border-cyan-500/35 bg-cyan-500/15 px-3 py-1 text-xs font-medium text-cyan-100">
+              {phaseLabel}
+            </span>
+            {elapsed > 0 ? (
+              <span className="text-[11px] tabular-nums text-zinc-500">
+                {formatDuration(elapsed)}
+              </span>
+            ) : null}
+          </div>
+        </div>
+      </div>
+
+      <div className="p-4 md:p-5">
+        <div
+          className={`grid gap-3 ${showOllama ? "sm:grid-cols-2 lg:grid-cols-4" : "sm:grid-cols-2 lg:grid-cols-3"}`}
+        >
+          <MetricCard title="Server queue" accent={multi ? "amber" : "cyan"}>
+            {queueFetchError && !queueStats ? (
+              <p className="text-amber-200/90">Could not load queue stats.</p>
+            ) : queueStats ? (
+              <>
+                <p className="tabular-nums">
+                  <span className="text-lg font-semibold text-white">
+                    {queueStats.active}
+                  </span>
+                  <span className="text-zinc-500"> active</span>
+                  {queueStats.queued > 0 || queueStats.running > 0 ? (
+                    <span className="block text-[11px] text-zinc-500">
+                      {queueStats.queued > 0 ? `${queueStats.queued} queued` : ""}
+                      {queueStats.queued > 0 && queueStats.running > 0 ? " · " : ""}
+                      {queueStats.running > 0 ? `${queueStats.running} running` : ""}
+                    </span>
+                  ) : null}
+                </p>
+                <p className="text-[11px] text-zinc-500">
+                  {queueStats.jobs_in_memory} job
+                  {queueStats.jobs_in_memory !== 1 ? "s" : ""} in memory
+                </p>
+              </>
+            ) : (
+              <p className="text-zinc-500">Loading…</p>
+            )}
+          </MetricCard>
+
+          <MetricCard title="Keepa (server)" accent="emerald">
+            {queueFetchError && !queueStats ? (
+              <p className="text-amber-200/90">Unavailable</p>
+            ) : queueStats ? (
+              <>
+                <p className="tabular-nums">
+                  <span className="text-lg font-semibold text-emerald-200">
+                    {queueStats.keepa_tokens_consumed_last_60s}
+                  </span>
+                  <span className="text-zinc-500"> tok / 60s</span>
+                </p>
+                <p className="text-[11px] text-zinc-500">
+                  {queueStats.keepa_live_calls_last_60s > 0
+                    ? `${queueStats.keepa_live_calls_last_60s} live API call${
+                        queueStats.keepa_live_calls_last_60s !== 1 ? "s" : ""
+                      }`
+                    : "No live calls in window"}
+                  {queueStats.keepa_refill_rate_last !== null ? (
+                    <>
+                      <br />
+                      Regen{" "}
+                      <span className="text-zinc-300">
+                        {queueStats.keepa_refill_rate_last}
+                      </span>
+                      /min
+                      {queueStats.keepa_tokens_left_last !== null ? (
+                        <>
+                          {" "}
+                          ·{" "}
+                          <span className="text-zinc-300">
+                            {queueStats.keepa_tokens_left_last}
+                          </span>{" "}
+                          left
+                        </>
+                      ) : null}
+                    </>
+                  ) : null}
+                </p>
+              </>
+            ) : (
+              <p className="text-zinc-500">Loading…</p>
+            )}
+          </MetricCard>
+
+          <MetricCard title="Claude (this run)" accent="violet">
+            {aReq > 0 || aTotal > 0 ? (
+              <>
+                <p className="tabular-nums">
+                  <span className="text-lg font-semibold text-violet-100">
+                    {aTotal.toLocaleString()}
+                  </span>
+                  <span className="text-zinc-500"> tokens</span>
+                </p>
+                <p className="text-[11px] text-zinc-500">
+                  {aIn > 0 || aOut > 0
+                    ? `${aIn.toLocaleString()} in · ${aOut.toLocaleString()} out · `
+                    : null}
+                  {aReq} call{aReq !== 1 ? "s" : ""} ·{" "}
+                  <span className="text-zinc-300">{claudeRpm}</span>/min
+                  {!isDone && elapsed < 5 ? (
+                    <span className="text-zinc-600"> (pace stabilizes ≥5s)</span>
+                  ) : null}
+                </p>
+              </>
+            ) : (
+              <p className="text-zinc-500">No Haiku calls yet (or using Ollama only).</p>
+            )}
+          </MetricCard>
+
+          {showOllama ? (
+            <MetricCard title="Ollama (this run)" accent="sky">
+              <p className="tabular-nums">
+                <span className="text-lg font-semibold text-sky-100">
+                  {oTotal.toLocaleString()}
+                </span>
+                <span className="text-zinc-500"> tokens</span>
+              </p>
+              <p className="text-[11px] text-zinc-500">
+                {oIn > 0 || oOut > 0
+                  ? `${oIn.toLocaleString()} in · ${oOut.toLocaleString()} out · `
+                  : null}
+                {oReq} request{oReq !== 1 ? "s" : ""}
+              </p>
+            </MetricCard>
+          ) : null}
+        </div>
+
+        {multi ? (
+          <p className="mt-4 rounded-lg border border-amber-400/20 bg-amber-950/20 px-3 py-2 text-[11px] leading-relaxed text-amber-100/90">
+            Multiple jobs share the same Keepa key and API limits — expect slower steps when others
+            are running.
+          </p>
+        ) : null}
+
+        <div className="mt-5">
+          <p className="mb-2 text-[10px] font-medium uppercase tracking-wider text-zinc-600">
+            Pipeline
+          </p>
+          <div className="flex gap-0.5 sm:gap-1">
+            {PHASE_ORDER.map((ph, i) => {
+              const done = isDone ? i <= activeIdx : i < activeIdx;
+              const current = !isDone && i === activeIdx;
+              return (
+                <div
+                  key={ph}
+                  className={`h-1.5 flex-1 rounded-full transition-all duration-500 ${
+                    done
+                      ? "bg-gradient-to-r from-cyan-400 to-sky-500 shadow-[0_0_12px_rgba(0,212,255,0.4)]"
+                      : current
+                        ? "bg-cyan-400/60"
+                        : "bg-white/10"
+                  }`}
+                  title={phaseUserLabel(ph)}
+                />
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-4 flex items-center gap-4">
+          <div
+            className="relative h-3 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-800 ring-1 ring-white/10"
+            role="progressbar"
+            aria-valuenow={indeterminate ? undefined : pct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            {indeterminate ? (
+              <div className="trasco-shimmer-bar absolute inset-0 overflow-hidden rounded-full bg-slate-700">
+                <div className="h-full w-1/3 animate-pulse rounded-full bg-gradient-to-r from-cyan-500 to-blue-500 motion-reduce:animate-none" />
+              </div>
+            ) : (
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-sky-400 to-blue-500 shadow-[0_0_20px_rgba(0,212,255,0.5)] transition-[width] duration-500 ease-out"
+                style={{ width: `${pct}%` }}
+              />
+            )}
+          </div>
+          {status.total > 0 ? (
+            <span className="shrink-0 font-mono text-xs tabular-nums text-zinc-400">
+              {status.current}/{status.total}
+            </span>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
 
 function ServerQueueBanner(props: { stats: QueueStats | null; fetchError: boolean }) {
   const { stats, fetchError } = props;
@@ -449,7 +758,7 @@ export default function HomeClient() {
   }, []);
 
   const onProcess = useCallback(
-    async (file: File | null) => {
+    async (file: File | null, debug: boolean) => {
       setError(null);
       if (!file) {
         setError("Choose an Excel or CSV file first.");
@@ -461,6 +770,7 @@ export default function HomeClient() {
       const ollama = useOllamaQueryFlags();
       q.set("use_ollama", ollama ? "true" : "false");
       q.set("use_ollama_asin_validate", "true");
+      if (debug) q.set("debug", "true");
       try {
         const startR = await fetch(
           `${apiBase()}/api/v1/process/start?${q.toString()}`,
@@ -505,7 +815,9 @@ export default function HomeClient() {
       </div>
 
       <div className="relative z-10 mx-auto max-w-5xl px-4 pb-20 pt-8 md:px-8 md:pt-12">
-        <ServerQueueBanner stats={queueStats} fetchError={queueFetchError} />
+        {!(busy === "process" && processProgress) ? (
+          <ServerQueueBanner stats={queueStats} fetchError={queueFetchError} />
+        ) : null}
         <header className="mb-10 md:mb-14">
           <div className="flex items-center gap-5 md:gap-8">
             <div
@@ -547,9 +859,11 @@ export default function HomeClient() {
             />
 
             {busy === "process" && processProgress ? (
-              <div className="mt-8">
-                <ProcessProgressDeck status={processProgress} />
-              </div>
+              <ProcessingDashboard
+                status={processProgress}
+                queueStats={queueStats}
+                queueFetchError={queueFetchError}
+              />
             ) : null}
 
             {error ? (
@@ -601,9 +915,10 @@ export default function HomeClient() {
 function RunConsole(props: {
   disabled: boolean;
   busy: boolean;
-  onRun: (file: File | null) => void;
+  onRun: (file: File | null, debug: boolean) => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
+  const [debug, setDebug] = useState(false);
   const [fileInputReady, setFileInputReady] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -658,164 +973,54 @@ function RunConsole(props: {
         />
       )}
 
-      <button
-        type="button"
-        disabled={props.disabled || props.busy}
-        onClick={() => props.onRun(file)}
-        className="group relative w-full overflow-hidden rounded-2xl bg-gradient-to-r from-cyan-500 via-sky-500 to-blue-600 px-6 py-4 text-base font-semibold text-slate-950 shadow-[0_0_32px_-4px_rgba(0,212,255,0.55)] transition enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45 md:text-lg"
-      >
-        <span className="relative z-10 flex items-center justify-center gap-2">
-          {props.busy ? (
-            <>
-              <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-900/30 border-t-slate-900" />
-              Working&hellip;
-            </>
-          ) : (
-            <>Run</>
-          )}
-        </span>
-        <span className="absolute inset-0 bg-gradient-to-r from-transparent via-white/25 to-transparent opacity-0 transition group-hover:translate-x-full group-hover:opacity-100 group-hover:duration-700" />
-      </button>
-    </div>
-  );
-}
-
-function ProcessProgressDeck(props: { status: ProcessStatus }) {
-  const { status } = props;
-  const indeterminate = status.total <= 0;
-  const pct =
-    status.total > 0
-      ? Math.min(100, Math.round((status.current / status.total) * 100))
-      : 0;
-  const activeIdx = phaseIndex(status.phase);
-  const isDone = status.phase === "done";
-  const phaseLabel = phaseUserLabel(status.phase);
-
-  const elapsed = Number(status.elapsed_sec) || 0;
-  const rowCount = Number(status.row_count) || 0;
-  let etaText = "";
-  if (!isDone && rowCount > 0 && elapsed > 5) {
-    const secPerRow = 1.2;
-    const estimatedTotal = rowCount * secPerRow;
-    const remaining = Math.max(0, estimatedTotal - elapsed);
-    etaText = formatEta(remaining);
-  }
-
-  return (
-    <section
-      className="rounded-2xl border border-cyan-500/20 bg-slate-950/60 p-5 backdrop-blur-md md:p-6"
-      aria-live="polite"
-      aria-busy={status.status !== "complete" && status.status !== "error"}
-    >
-      <div className="flex items-center justify-between">
-        {etaText ? (
-          <span className="text-xs text-zinc-500">{etaText}</span>
-        ) : (
-          <span />
-        )}
-        <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-200">
-          {phaseLabel}
-        </span>
-      </div>
-
-      <div className="mt-4 flex gap-0.5 sm:gap-1">
-        {PHASE_ORDER.map((ph, i) => {
-          const done = isDone ? i <= activeIdx : i < activeIdx;
-          const current = !isDone && i === activeIdx;
-          return (
-            <div
-              key={ph}
-              className={`h-1.5 flex-1 rounded-full transition-all duration-500 ${
-                done
-                  ? "bg-gradient-to-r from-cyan-400 to-sky-500 shadow-[0_0_12px_rgba(0,212,255,0.4)]"
-                  : current
-                    ? "bg-cyan-400/60"
-                    : "bg-white/10"
-              }`}
-              title={phaseUserLabel(ph)}
-            />
-          );
-        })}
-      </div>
-
-      <div className="mt-5 flex items-center gap-4">
-        <div
-          className="relative h-3 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-800 ring-1 ring-white/10"
-          role="progressbar"
-          aria-valuenow={indeterminate ? undefined : pct}
-          aria-valuemin={0}
-          aria-valuemax={100}
+      <div className="flex items-center justify-between gap-4">
+        <button
+          type="button"
+          disabled={props.disabled || props.busy}
+          onClick={() => props.onRun(file, debug)}
+          className="group relative flex-1 overflow-hidden rounded-2xl bg-gradient-to-r from-cyan-500 via-sky-500 to-blue-600 px-6 py-4 text-base font-semibold text-slate-950 shadow-[0_0_32px_-4px_rgba(0,212,255,0.55)] transition enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45 md:text-lg"
         >
-          {indeterminate ? (
-            <div className="trasco-shimmer-bar absolute inset-0 overflow-hidden rounded-full bg-slate-700">
-              <div className="h-full w-1/3 animate-pulse rounded-full bg-gradient-to-r from-cyan-500 to-blue-500 motion-reduce:animate-none" />
-            </div>
-          ) : (
-            <div
-              className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-sky-400 to-blue-500 shadow-[0_0_20px_rgba(0,212,255,0.5)] transition-[width] duration-500 ease-out"
-              style={{ width: `${pct}%` }}
-            />
-          )}
-        </div>
-        {status.total > 0 ? (
-          <span className="shrink-0 font-mono text-xs tabular-nums text-zinc-400">
-            {status.current}/{status.total}
+          <span className="relative z-10 flex items-center justify-center gap-2">
+            {props.busy ? (
+              <>
+                <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-900/30 border-t-slate-900" />
+                Working&hellip;
+              </>
+            ) : (
+              <>Run</>
+            )}
           </span>
-        ) : null}
+          <span className="absolute inset-0 bg-gradient-to-r from-transparent via-white/25 to-transparent opacity-0 transition group-hover:translate-x-full group-hover:opacity-100 group-hover:duration-700" />
+        </button>
       </div>
-      {elapsed > 0 && !isDone ? (
-        <p className="mt-2 text-right text-[11px] tabular-nums text-zinc-600">
-          {formatDuration(elapsed)} elapsed
-        </p>
-      ) : null}
-      <ClaudeRunMetrics status={status} elapsed={elapsed} isDone={isDone} />
-    </section>
-  );
-}
 
-function ClaudeRunMetrics(props: {
-  status: ProcessStatus;
-  elapsed: number;
-  isDone: boolean;
-}) {
-  const { status, elapsed, isDone } = props;
-  const req = Number(status.anthropic_requests) || 0;
-  const inTok = Number(status.anthropic_input_tokens) || 0;
-  const outTok = Number(status.anthropic_output_tokens) || 0;
-  const total = Number(status.anthropic_total_tokens) || inTok + outTok;
-  if (req <= 0 && total <= 0) {
-    return null;
-  }
-  const secForRate = isDone ? Math.max(elapsed, 0.001) : Math.max(elapsed, 5);
-  const rpm =
-    req > 0 ? Math.round(((req * 60) / secForRate) * 10) / 10 : 0;
-
-  return (
-    <div className="mt-4 rounded-xl border border-violet-500/20 bg-violet-950/20 px-3 py-2.5 text-[11px] text-zinc-400">
-      <div className="font-medium text-violet-200/90">Claude (Haiku) — this run</div>
-      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 tabular-nums">
-        <span>
-          <span className="text-zinc-500">Tokens</span>{" "}
-          <span className="text-zinc-200">{total.toLocaleString()}</span>
-          {inTok > 0 || outTok > 0 ? (
-            <span className="text-zinc-600">
-              {" "}
-              ({inTok.toLocaleString()} in / {outTok.toLocaleString()} out)
-            </span>
-          ) : null}
+      <label className="flex items-center gap-2.5 cursor-pointer select-none group">
+        <input
+          type="checkbox"
+          checked={debug}
+          onChange={(e) => setDebug(e.target.checked)}
+          disabled={props.disabled}
+          className="peer sr-only"
+        />
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-white/20 bg-slate-900/80 transition peer-checked:border-amber-400/60 peer-checked:bg-amber-500/20 peer-focus-visible:ring-2 peer-focus-visible:ring-cyan-400/60 group-hover:border-white/30">
+          <svg
+            className="hidden h-3.5 w-3.5 text-amber-300 peer-checked:block"
+            viewBox="0 0 14 14"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2.5}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            style={{ display: debug ? "block" : "none" }}
+          >
+            <path d="M2.5 7.5L5.5 10.5L11.5 3.5" />
+          </svg>
         </span>
-        <span>
-          <span className="text-zinc-500">API calls</span>{" "}
-          <span className="text-zinc-200">{req}</span>
+        <span className="text-xs text-zinc-500 group-hover:text-zinc-400 transition">
+          Debug mode
+          <span className="ml-1.5 text-[10px] text-zinc-600">(extra diagnostic columns in output)</span>
         </span>
-        <span>
-          <span className="text-zinc-500">Calls/min</span>{" "}
-          <span className="text-zinc-200">{rpm}</span>
-          {!isDone && elapsed < 5 ? (
-            <span className="text-zinc-600"> (pace until 5s elapsed)</span>
-          ) : null}
-        </span>
-      </div>
+      </label>
     </div>
   );
 }
