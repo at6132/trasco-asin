@@ -153,6 +153,7 @@ def _run_one_finder_attempt(
     anthropic_api_key: Optional[str] = None,
     haiku_model: str = "",
     anthropic_usage: Optional[AnthropicUsageLedger] = None,
+    exclude_asins: Optional[set[str]] = None,
 ) -> Optional[tuple[dict[str, Any], str, float, str]]:
     """
     Returns (product, reason_suffix, finder_score, finder_how) or None.
@@ -167,6 +168,10 @@ def _run_one_finder_attempt(
     if not asins:
         return None
     take = asins[:30]
+    if exclude_asins:
+        take = [a for a in take if a.strip().upper() not in exclude_asins]
+        if not take:
+            return None
     prods = fetch_keepa_products_batch(
         api_key,
         take,
@@ -239,6 +244,7 @@ def resolve_via_product_finder(
     source_file_hint: Optional[str] = None,
     ollama_usage: Optional[OllamaTokenLedger] = None,
     anthropic_usage: Optional[AnthropicUsageLedger] = None,
+    exclude_asins: Optional[set[str]] = None,
 ) -> tuple[Optional[dict[str, Any]], str]:
     """
     Returns (product_dict or None, reason_code).
@@ -251,12 +257,14 @@ def resolve_via_product_finder(
         return None, "no_sku_or_mpn"
 
     cache_sku = sku_k or mpn_n
-    cached = get_cached_sku_resolve(cache, domain, br_k, cache_sku)
-    if isinstance(cached, dict):
-        if cached.get("product") is not None:
-            return cached["product"], str(cached.get("via", "cache"))
-        if cached.get("via") == "not_found":
-            return None, f"cache:{cached.get('reason', 'not_found')}"
+    _skip_cache = bool(exclude_asins)
+    if not _skip_cache:
+        cached = get_cached_sku_resolve(cache, domain, br_k, cache_sku)
+        if isinstance(cached, dict):
+            if cached.get("product") is not None:
+                return cached["product"], str(cached.get("via", "cache"))
+            if cached.get("via") == "not_found":
+                return None, f"cache:{cached.get('reason', 'not_found')}"
 
     part = mpn_n or sku_k
     use_llm_pick = bool(
@@ -309,6 +317,7 @@ def resolve_via_product_finder(
                 anthropic_api_key=anthropic_api_key,
                 haiku_model=haiku_model,
                 anthropic_usage=anthropic_usage,
+                exclude_asins=exclude_asins,
             )
             if hit:
                 return _cache_hit(hit)
@@ -382,6 +391,7 @@ def resolve_via_product_finder(
                     anthropic_api_key=anthropic_api_key,
                     haiku_model=haiku_model,
                     anthropic_usage=anthropic_usage,
+                    exclude_asins=exclude_asins,
                 )
                 if hit:
                     return _cache_hit(hit)

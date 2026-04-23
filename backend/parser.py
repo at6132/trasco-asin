@@ -20,6 +20,22 @@ from openpyxl import load_workbook
 from backend.anthropic_usage import AnthropicUsageLedger, record_anthropic_messages_response
 from backend.ollama_usage import OllamaTokenLedger, record_chat_response
 
+_MPN_FROM_TITLE_RE = re.compile(
+    r"\b([A-Z]{1,5}[\-]?\d{2,}(?:[/\-][A-Z0-9]+)*)\b", re.IGNORECASE
+)
+
+
+def _extract_mpn_from_title(title: Optional[str]) -> Optional[str]:
+    """Best-effort model/part number from a free-text description (e.g. 'CA6903/22')."""
+    if not title:
+        return None
+    candidates = _MPN_FROM_TITLE_RE.findall(title)
+    if not candidates:
+        return None
+    best = max(candidates, key=len)
+    return best.strip() if best.strip() else None
+
+
 if __package__:
     from .validator import normalize_asin, normalize_gtin
 else:
@@ -526,6 +542,12 @@ def _parse_sheet_matrix(
 
         row_obj["_sheet_title_text"] = _sheet_title_for_match(row_obj, mapping)
         row_obj["_sheet_brand"] = _sheet_brand_text(row_obj, mapping)
+        if not row_obj.get("_sku") and not row_obj.get("_mpn"):
+            row_obj["_mpn_from_title"] = _extract_mpn_from_title(
+                row_obj["_sheet_title_text"]
+            )
+        else:
+            row_obj["_mpn_from_title"] = None
         row_obj["_mapping"] = dict(mapping)
         row_obj["_column_order"] = list(headers)
         rows.append(row_obj)

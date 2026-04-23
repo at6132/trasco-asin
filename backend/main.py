@@ -316,22 +316,45 @@ def _resolved_asin_confidence_product(
         dbg["dbg_llm_pick_method"] = ""
         dbg["dbg_llm_validate_verdict"] = ""
         dbg["dbg_llm_validate_reason"] = ""
+        dbg["dbg_fallback_attempted"] = ""
+        dbg["dbg_fallback_result"] = ""
 
     prod: Optional[dict[str, Any]] = None
     base_trace = ""
+    gtin_fallback = bool(row.get("_gtin_fallback"))
     if dkey:
         dk = (domain, dkey[0], dkey[1])
         kind, raw_val = dkey[0], str(dkey[1])
         val_snip = _trace_snip(f"{kind}={raw_val}", 72)
         if debug:
             dbg["dbg_resolution_path"] = f"direct_{kind}"
+        direct_failed = False
         if dk in errors:
-            err = _trace_snip(errors[dk], 220)
-            return "", "NOT FOUND", None, f"path=direct|{val_snip}|keepa_err={err}", dbg
-        prod = keepa_products.get(dk)
-        if not prod:
-            return "", "NOT FOUND", None, f"path=direct|{val_snip}|no_product", dbg
-        base_trace = f"path=direct|{val_snip}"
+            direct_failed = True
+        else:
+            prod = keepa_products.get(dk)
+            if not prod:
+                direct_failed = True
+        if direct_failed and gtin_fallback and sk and sk in sku_results:
+            prod, sku_reason = sku_results[sk]
+            base_trace = f"path=gtin_fallback|{val_snip}|{_trace_snip(sku_reason, 250)}"
+            if debug:
+                dbg["dbg_resolution_path"] = "gtin_fallback"
+                dbg["dbg_winning_attempt"] = sku_reason
+                dbg["dbg_fallback_attempted"] = "yes"
+            if not prod:
+                if debug:
+                    dbg["dbg_fallback_result"] = "finder_no_match"
+                return "", "NOT FOUND", None, base_trace, dbg
+            if debug:
+                dbg["dbg_fallback_result"] = f"found:{prod.get('asin', '')}"
+        elif direct_failed:
+            err_detail = _trace_snip(errors.get(dk, "no_product"), 220)
+            if debug and gtin_fallback:
+                dbg["dbg_fallback_attempted"] = "no_text"
+            return "", "NOT FOUND", None, f"path=direct|{val_snip}|keepa_err={err_detail}", dbg
+        else:
+            base_trace = f"path=direct|{val_snip}"
     elif sk and sk in sku_results:
         prod, sku_reason = sku_results[sk]
         base_trace = f"path=sku|{_trace_snip(sku_reason, 300)}"
@@ -632,12 +655,33 @@ def run_process_pipeline(
         with ThreadPoolExecutor(max_workers=pool_c) as pool:
             list(pool.map(_one_code, code_direct))
 
+    failed_gtin_keys: set[tuple[int, str, str]] = set()
+    for dk in code_direct:
+        if dk in errors:
+            failed_gtin_keys.add(dk)
+
     sku_keys: list[str] = []
     sku_row_for: dict[str, dict[str, Any]] = {}
     seen_sku: set[str] = set()
     for row in rows_in:
-        if _direct_lookup_key(row):
-            continue
+        dkey = _direct_lookup_key(row)
+        if dkey:
+            dom = int(row.get("_keepa_domain") or settings.keepa_domain)
+            dk = (dom, dkey[0], dkey[1])
+            if dk not in failed_gtin_keys:
+                continue
+            fallback_mpn = row.get("_mpn_from_title")
+            has_text = bool(
+                fallback_mpn
+                or (row.get("_sheet_title_text") or "").strip()
+            )
+            if not has_text:
+                continue
+            if fallback_mpn and not row.get("_mpn"):
+                row["_mpn"] = fallback_mpn
+            if not row.get("_sku") and not row.get("_mpn"):
+                continue
+            row["_gtin_fallback"] = True
         dom = int(row.get("_keepa_domain") or settings.keepa_domain)
         sk = sku_resolve_storage_key(dom, row)
         if sk and sk not in seen_sku:
@@ -714,6 +758,8 @@ def run_process_pipeline(
         "dbg_llm_pick_method",
         "dbg_llm_validate_verdict",
         "dbg_llm_validate_reason",
+        "dbg_fallback_attempted",
+        "dbg_fallback_result",
     ]
 
     sections: list[tuple[str, list[str], list[dict[str, Any]]]] = []
@@ -800,6 +846,8 @@ def run_process_pipeline(
                 haiku_rpm = RpmLimiter(requests_per_minute=500)
                 n_workers = 1
             tracker.configure_llm_pool(n_workers)
+            val_counter = [0]
+            val_lock = threading.Lock()
 
             def _validate_one(
                 idx: int,
@@ -891,6 +939,24 @@ def run_process_pipeline(
                         n_val,
                     )
 
+            llm_rejected: list[tuple[dict[str, Any], dict[str, Any], str, str, str, str]] = []
+            reject_lock = threading.Lock()
+
+            def _validate_one_and_collect(
+                idx: int,
+                line: dict[str, Any],
+                row: dict[str, Any],
+                asin_h: str,
+                conf_h: str,
+                prod: dict[str, Any],
+                log_h: str,
+                reject_asin_h: str,
+            ) -> None:
+                _validate_one(idx, line, row, asin_h, conf_h, prod, log_h, reject_asin_h)
+                if line.get(conf_h) == "NOT FOUND (LLM)":
+                    with reject_lock:
+                        llm_rejected.append((line, row, asin_h, conf_h, log_h, reject_asin_h))
+
             rpm_note = f", {rpm_cap} RPM cap" if use_haiku_asin else ""
             p(
                 "ollama_asin",
@@ -901,11 +967,103 @@ def run_process_pipeline(
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 futs = []
                 for i, (line, row, ah, ch, prod, lh, rh) in enumerate(validate_queue):
-                    futs.append(pool.submit(_validate_one, i, line, row, ah, ch, prod, lh, rh))
+                    futs.append(pool.submit(_validate_one_and_collect, i, line, row, ah, ch, prod, lh, rh))
                 for fut in as_completed(futs):
                     exc = fut.exception()
                     if exc:
                         logger.warning("LLM ASIN validate worker error: %s", exc)
+
+            retry_candidates = [
+                (line, row, ah, ch, lh, rah)
+                for line, row, ah, ch, lh, rah in llm_rejected
+                if (row.get("_mpn_from_title") or row.get("_mpn") or row.get("_sku")
+                    or (row.get("_sheet_title_text") or "").strip())
+            ]
+            if retry_candidates:
+                n_retry = len(retry_candidates)
+                p("keepa_sku", f"Finder retry for {n_retry} LLM-rejected row(s)…", 0, n_retry)
+                retry_pool_n = min(kpx, max(1, n_retry))
+                tracker.configure_keepa_pool(retry_pool_n)
+                retry_counter = [0]
+                retry_count_lock = threading.Lock()
+
+                def _retry_one(
+                    item: tuple[dict[str, Any], dict[str, Any], str, str, str, str],
+                ) -> None:
+                    line, row, asin_h_l, conf_h_l, log_h_l, rej_h_l = item
+                    rejected_asin = str(line.get(rej_h_l) or "").strip().upper()
+                    excl = {rejected_asin} if rejected_asin else set()
+                    row_dom = int(row.get("_keepa_domain") or settings.keepa_domain)
+                    mpn_fb = row.get("_mpn_from_title") or row.get("_mpn")
+                    sku_fb = row.get("_sku")
+                    with tracker.keepa_slot():
+                        try:
+                            prod2, reason2 = resolve_via_product_finder(
+                                settings.keepa_api_key,
+                                row_dom,
+                                cache,
+                                brand=row.get("_sheet_brand"),
+                                sku=sku_fb,
+                                mpn=mpn_fb,
+                                title_hint=row.get("_sheet_title_text"),
+                                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                                throttle=throttle,
+                                anthropic_api_key=settings.anthropic_api_key,
+                                haiku_model=settings.haiku_model,
+                                ollama_base_url=settings.ollama_base_url,
+                                ollama_model=settings.ollama_model,
+                                ollama_timeout_sec=float(settings.ollama_asin_validate_timeout_sec),
+                                use_ollama_resolver_gemma=settings.use_ollama_resolver_gemma,
+                                source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
+                                ollama_usage=ollama_ledger,
+                                anthropic_usage=anthropic_ledger,
+                                exclude_asins=excl,
+                            )
+                        except Exception as e:
+                            prod2, reason2 = None, str(e)
+                    if prod2:
+                        new_asin = prod2.get("asin", "")
+                        ok_t, t_sc, t_why = validate_title_match(
+                            row.get("_sheet_title_text"), prod2.get("title"),
+                        )
+                        ok_b, b_sc, b_why = validate_brand_match(
+                            row.get("_sheet_brand"),
+                            next((prod2.get(k) for k in ("brand", "manufacturer")
+                                  if isinstance(prod2.get(k), str) and prod2.get(k, "").strip()), None),
+                        )
+                        pk_ok, _sp, _ap, pk_why = pack_consistency(
+                            row.get("_sheet_title_text"), prod2.get("title"),
+                        )
+                        st = "pack_mismatch" if not pk_ok else ("ok" if ok_t else "ok_with_warnings")
+                        conf2 = aggregate_confidence(
+                            status=st, title_match=ok_t, brand_match=ok_b,
+                            title_score=t_sc, pack_ok=pk_ok,
+                        )
+                        line[asin_h_l] = str(new_asin)
+                        line[conf_h_l] = conf2
+                        line[log_h_l] = _append_trace(
+                            str(line.get(log_h_l) or ""),
+                            f"llm_reject_retry|finder={_trace_snip(reason2, 200)}"
+                            f"|t_sc={t_sc:.2f}|b_sc={b_sc:.2f}|conf={conf2}",
+                        )
+                        if debug:
+                            line["dbg_fallback_attempted"] = "yes_llm_retry"
+                            line["dbg_fallback_result"] = f"found:{new_asin}"
+                    else:
+                        line[log_h_l] = _append_trace(
+                            str(line.get(log_h_l) or ""),
+                            f"llm_reject_retry_failed|{_trace_snip(reason2, 200)}",
+                        )
+                        if debug:
+                            line["dbg_fallback_attempted"] = "yes_llm_retry"
+                            line["dbg_fallback_result"] = "finder_no_match"
+                    with retry_count_lock:
+                        retry_counter[0] += 1
+                        done_r = retry_counter[0]
+                    p("keepa_sku", f"Finder retry {done_r} of {n_retry}…", done_r, n_retry)
+
+                with ThreadPoolExecutor(max_workers=retry_pool_n) as pool:
+                    list(pool.map(_retry_one, retry_candidates))
 
     p("workbook", "Writing Excel workbook…", 0, 0)
     buf = workbook_from_sheet_sections(sections)
