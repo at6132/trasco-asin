@@ -53,6 +53,7 @@ from backend.process_history import append_manifest, history_result_path, list_h
 from backend.resolution import resolve_via_product_finder, sku_resolve_storage_key
 from backend.validator import (
     aggregate_confidence,
+    normalize_text,
     pack_consistency,
     validate_brand_match,
     validate_title_match,
@@ -268,8 +269,9 @@ def _resolved_asin_confidence_product(
     errors: dict[tuple[int, str, str], str],
     sku_results: dict[str, tuple[Optional[dict[str, Any]], str]],
     settings: Settings,
-) -> tuple[str, str, Optional[dict[str, Any]], str]:
-    """Amazon ASIN, confidence tier, Keepa product dict when resolved, and a compact trace string."""
+    debug: bool = False,
+) -> tuple[str, str, Optional[dict[str, Any]], str, dict[str, Any]]:
+    """Amazon ASIN, confidence tier, Keepa product dict when resolved, a compact trace string, and debug dict."""
     sheet_title = row.get("_sheet_title_text")
     sheet_brand = row.get("_sheet_brand")
     domain = int(row.get("_keepa_domain") or settings.keepa_domain)
@@ -277,33 +279,63 @@ def _resolved_asin_confidence_product(
     sk = sku_resolve_storage_key(domain, row)
     flags = _identifier_flags(row)
 
+    dbg: dict[str, Any] = {}
+    if debug:
+        dbg["dbg_parsed_asin"] = row.get("_asin") or ""
+        dbg["dbg_parsed_gtin"] = row.get("_gtin") or ""
+        dbg["dbg_parsed_sku"] = row.get("_sku") or ""
+        dbg["dbg_parsed_mpn"] = row.get("_mpn") or ""
+        dbg["dbg_parsed_brand"] = sheet_brand or ""
+        dbg["dbg_parsed_title"] = sheet_title or ""
+        dbg["dbg_keepa_domain"] = domain
+        dbg["dbg_resolution_path"] = ""
+        dbg["dbg_winning_attempt"] = ""
+        dbg["dbg_title_score"] = ""
+        dbg["dbg_brand_score"] = ""
+        dbg["dbg_brand_sheet"] = ""
+        dbg["dbg_brand_keepa"] = ""
+        dbg["dbg_pack_sheet"] = ""
+        dbg["dbg_pack_keepa"] = ""
+        dbg["dbg_keepa_title"] = ""
+        dbg["dbg_llm_pick_method"] = ""
+        dbg["dbg_llm_validate_verdict"] = ""
+        dbg["dbg_llm_validate_reason"] = ""
+
     prod: Optional[dict[str, Any]] = None
     base_trace = ""
     if dkey:
         dk = (domain, dkey[0], dkey[1])
         kind, raw_val = dkey[0], str(dkey[1])
         val_snip = _trace_snip(f"{kind}={raw_val}", 72)
+        if debug:
+            dbg["dbg_resolution_path"] = f"direct_{kind}"
         if dk in errors:
             err = _trace_snip(errors[dk], 220)
-            return "", "NOT FOUND", None, f"path=direct|{val_snip}|keepa_err={err}"
+            return "", "NOT FOUND", None, f"path=direct|{val_snip}|keepa_err={err}", dbg
         prod = keepa_products.get(dk)
         if not prod:
-            return "", "NOT FOUND", None, f"path=direct|{val_snip}|no_product"
+            return "", "NOT FOUND", None, f"path=direct|{val_snip}|no_product", dbg
         base_trace = f"path=direct|{val_snip}"
     elif sk and sk in sku_results:
         prod, sku_reason = sku_results[sk]
         base_trace = f"path=sku|{_trace_snip(sku_reason, 300)}"
+        if debug:
+            dbg["dbg_resolution_path"] = "sku_finder"
+            dbg["dbg_winning_attempt"] = sku_reason
         if not prod:
-            return "", "NOT FOUND", None, base_trace
+            return "", "NOT FOUND", None, base_trace, dbg
     else:
+        if debug:
+            dbg["dbg_resolution_path"] = "no_keys" if not sk else "sku_key_missing"
         if sk:
             return (
                 "",
                 "NOT FOUND",
                 None,
                 f"path=sku|resolver_key_missing_from_batch|id={flags}",
+                dbg,
             )
-        return "", "NOT FOUND", None, f"path=no_keys|id={flags}"
+        return "", "NOT FOUND", None, f"path=no_keys|id={flags}", dbg
 
     keepa_title = prod.get("title")
     keepa_brand = None
@@ -316,6 +348,15 @@ def _resolved_asin_confidence_product(
     ok_title, title_score, title_why = validate_title_match(sheet_title, keepa_title)
     ok_brand, brand_sc, brand_why = validate_brand_match(sheet_brand, keepa_brand)
     pack_ok, _sp, _ap, pack_why = pack_consistency(sheet_title, keepa_title)
+
+    if debug:
+        dbg["dbg_title_score"] = round(title_score, 4)
+        dbg["dbg_brand_score"] = round(brand_sc, 4)
+        dbg["dbg_brand_sheet"] = normalize_text(sheet_brand)
+        dbg["dbg_brand_keepa"] = normalize_text(keepa_brand)
+        dbg["dbg_pack_sheet"] = _sp if _sp is not None else ""
+        dbg["dbg_pack_keepa"] = _ap if _ap is not None else ""
+        dbg["dbg_keepa_title"] = str(keepa_title or "")[:500]
 
     if not pack_ok:
         row_status = "pack_mismatch"
@@ -338,7 +379,7 @@ def _resolved_asin_confidence_product(
         f"|pk_ok={int(pack_ok)}|pk={pack_why}|conf={conf}"
     )
     full_trace = f"{base_trace}|{match_tail}"
-    return (str(ra) if ra else ""), conf, prod, _trace_snip(full_trace, 950)
+    return (str(ra) if ra else ""), conf, prod, _trace_snip(full_trace, 950), dbg
 
 
 ProgressCb = Optional[Callable[[str, str, int, int], None]]
@@ -567,6 +608,28 @@ def run_process_pipeline(
         except Exception as e:
             sku_results[sk] = (None, str(e))
 
+    _DEBUG_HEADERS = [
+        "dbg_parsed_asin",
+        "dbg_parsed_gtin",
+        "dbg_parsed_sku",
+        "dbg_parsed_mpn",
+        "dbg_parsed_brand",
+        "dbg_parsed_title",
+        "dbg_keepa_domain",
+        "dbg_resolution_path",
+        "dbg_winning_attempt",
+        "dbg_title_score",
+        "dbg_brand_score",
+        "dbg_brand_sheet",
+        "dbg_brand_keepa",
+        "dbg_pack_sheet",
+        "dbg_pack_keepa",
+        "dbg_keepa_title",
+        "dbg_llm_pick_method",
+        "dbg_llm_validate_verdict",
+        "dbg_llm_validate_reason",
+    ]
+
     sections: list[tuple[str, list[str], list[dict[str, Any]]]] = []
     grouped = _group_rows_by_sheet(rows_in)
     n_sheets = len(grouped) or 1
@@ -583,6 +646,8 @@ def run_process_pipeline(
                 k for k in sheet_rows[0].keys() if isinstance(k, str) and not k.startswith("_")
             ]
         headers, asin_h, conf_h, log_h, reject_asin_h = passthrough_headers(col_order)
+        if debug:
+            headers = headers + _DEBUG_HEADERS
         out_rows: list[dict[str, Any]] = []
         total_r = len(sheet_rows)
         for ri, row in enumerate(sheet_rows, start=1):
@@ -593,18 +658,22 @@ def run_process_pipeline(
                     ri,
                     max(total_r, 1),
                 )
-            ra, conf, prod, trace = _resolved_asin_confidence_product(
+            ra, conf, prod, trace, dbg = _resolved_asin_confidence_product(
                 row,
                 keepa_products=keepa_products,
                 errors=errors,
                 sku_results=sku_results,
                 settings=settings,
+                debug=debug,
             )
             line = {h: row.get(h) for h in col_order}
             line[asin_h] = ra
             line[conf_h] = conf
             line[log_h] = trace
             line[reject_asin_h] = ""
+            if debug:
+                for dh in _DEBUG_HEADERS:
+                    line[dh] = dbg.get(dh, "")
             out_rows.append(line)
             if (
                 do_llm_asin
@@ -693,6 +762,10 @@ def run_process_pipeline(
                         ollama_usage=ollama_ledger,
                         timeout=tmo,
                     )
+                if debug:
+                    line["dbg_llm_pick_method"] = label
+                    line["dbg_llm_validate_verdict"] = verdict
+                    line["dbg_llm_validate_reason"] = _trace_snip(note or "", 500)
                 if verdict == "reject":
                     line[reject_asin_h] = ra0
                     line[asin_h] = ""
@@ -846,6 +919,7 @@ async def _run_process_job(
     use_ollama: bool,
     max_rows: int,
     use_ollama_asin_validate: bool,
+    debug: bool = False,
 ) -> None:
     job = _process_jobs.get(job_id)
     if job is None:
@@ -888,6 +962,7 @@ async def _run_process_job(
             on_row_count=set_row_count,
             anthropic_usage=anthropic_ledger,
             ollama_usage=ollama_ledger,
+            debug=debug,
         )
         xlsx_bytes = buf.getvalue()
         path = save_result_xlsx(job_id, xlsx_bytes)
@@ -942,6 +1017,7 @@ async def process_sheet(
     use_ollama: bool = False,
     use_ollama_asin_validate: bool = False,
     max_rows: int = 10_000,
+    debug: bool = False,
 ) -> StreamingResponse:
     if not settings.keepa_api_key.strip():
         raise HTTPException(500, "KEEPA_API_KEY is not configured in .env")
@@ -959,6 +1035,7 @@ async def process_sheet(
             max_rows=max_rows,
             progress=None,
             use_ollama_asin_validate=use_ollama_asin_validate,
+            debug=debug,
         )
     except RuntimeError as e:
         raise HTTPException(400, str(e)) from e
@@ -981,6 +1058,7 @@ async def process_start(
     use_ollama: bool = False,
     use_ollama_asin_validate: bool = False,
     max_rows: int = 10_000,
+    debug: bool = False,
 ) -> dict[str, str]:
     if not settings.keepa_api_key.strip():
         raise HTTPException(500, "KEEPA_API_KEY is not configured in .env")
@@ -1007,6 +1085,7 @@ async def process_start(
             use_ollama,
             max_rows,
             use_ollama_asin_validate,
+            debug,
         )
     )
     return {"job_id": job_id}
