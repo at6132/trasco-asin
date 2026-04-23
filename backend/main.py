@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.cache import Cache
+from backend.keepa_telemetry import get_keepa_telemetry
 from backend.lookup import (
     KeepaError,
     KeepaThrottle,
@@ -771,6 +772,31 @@ def _purge_stale_jobs() -> None:
         _process_jobs.pop(jid, None)
 
 
+def _process_queue_stats() -> dict[str, Any]:
+    """Counts jobs still held in memory (for UI: shared Keepa / API load)."""
+    queued = running = complete = error = 0
+    for j in _process_jobs.values():
+        with j.lock:
+            st = j.status
+        if st == "queued":
+            queued += 1
+        elif st == "running":
+            running += 1
+        elif st == "complete":
+            complete += 1
+        elif st == "error":
+            error += 1
+    active = queued + running
+    return {
+        "jobs_in_memory": len(_process_jobs),
+        "active": active,
+        "queued": queued,
+        "running": running,
+        "complete": complete,
+        "error": error,
+    }
+
+
 def _job_snapshot(job: ProcessJob) -> dict[str, Any]:
     with job.lock:
         elapsed = round(time.time() - job.started_at, 1)
@@ -945,6 +971,15 @@ async def process_start(
     return {"job_id": job_id}
 
 
+@app.get("/api/v1/process/queue-stats")
+def process_queue_stats() -> dict[str, Any]:
+    """How many process jobs are in memory; active = queued + running (shared server load)."""
+    _purge_stale_jobs()
+    out = _process_queue_stats()
+    out.update(get_keepa_telemetry())
+    return out
+
+
 @app.get("/api/v1/process/status/{job_id}")
 def process_status(job_id: str) -> dict[str, Any]:
     job = _process_jobs.get(job_id)
@@ -1041,4 +1076,5 @@ def root() -> dict[str, Any]:
         "process_result": "GET /api/v1/process/result/{job_id}",
         "process_history": "GET /api/v1/process/history",
         "process_history_result": "GET /api/v1/process/history/{job_id}/result",
+        "process_queue_stats": "GET /api/v1/process/queue-stats",
     }

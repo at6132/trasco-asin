@@ -90,6 +90,122 @@ function clearActiveJob(): void {
   } catch {}
 }
 
+type QueueStats = {
+  jobs_in_memory: number;
+  active: number;
+  queued: number;
+  running: number;
+  complete: number;
+  error: number;
+  keepa_tokens_consumed_last_60s: number;
+  keepa_live_calls_last_60s: number;
+  keepa_tokens_left_last: number | null;
+  keepa_refill_rate_last: number | null;
+};
+
+const QUEUE_POLL_MS = 4000;
+
+function ServerQueueBanner(props: { stats: QueueStats | null; fetchError: boolean }) {
+  const { stats, fetchError } = props;
+  if (fetchError && !stats) {
+    return (
+      <div
+        className="mb-6 rounded-xl border border-amber-500/25 bg-amber-950/30 px-4 py-2.5 text-xs text-amber-100/90"
+        role="status"
+      >
+        Could not load server queue stats.
+      </div>
+    );
+  }
+  if (!stats) {
+    return (
+      <div className="mb-6 h-10 rounded-xl border border-white/5 bg-slate-950/40 animate-pulse" aria-hidden />
+    );
+  }
+
+  const { active, queued, running, jobs_in_memory } = stats;
+  const multi = active > 1;
+  const k60 = stats.keepa_tokens_consumed_last_60s;
+  const kCalls = stats.keepa_live_calls_last_60s;
+  const kLeft = stats.keepa_tokens_left_last;
+  const kRefill = stats.keepa_refill_rate_last;
+
+  return (
+    <div
+      className={`mb-6 rounded-xl border px-4 py-3 text-sm ${
+        multi
+          ? "border-amber-400/35 bg-amber-950/25 text-amber-50/95"
+          : "border-cyan-500/20 bg-slate-950/60 text-zinc-300"
+      }`}
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <span className="font-medium text-white/90">
+          Server queue:{" "}
+          <span className="tabular-nums text-cyan-200">{active}</span> active
+          {active !== 1 ? " jobs" : " job"}
+          {queued > 0 || running > 0 ? (
+            <span className="ml-2 font-normal text-zinc-400">
+              ({queued > 0 ? `${queued} queued` : ""}
+              {queued > 0 && running > 0 ? ", " : ""}
+              {running > 0 ? `${running} running` : ""})
+            </span>
+          ) : null}
+        </span>
+        <span className="text-[11px] tabular-nums text-zinc-500">
+          {jobs_in_memory} job{jobs_in_memory !== 1 ? "s" : ""} in memory
+        </span>
+      </div>
+      <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-t border-white/10 pt-2 text-[11px] text-zinc-400">
+        <span>
+          <span className="text-zinc-500">Keepa (server, rolling 60s):</span>{" "}
+          <span className="tabular-nums font-medium text-emerald-200/90">{k60}</span> tokens
+          {kCalls > 0 ? (
+            <span className="text-zinc-500">
+              {" "}
+              ({kCalls} live {kCalls !== 1 ? "calls" : "call"})
+            </span>
+          ) : null}
+          <span className="text-zinc-500"> ≈ tokens/min burn</span>
+        </span>
+        <span className="tabular-nums text-zinc-500">
+          {kRefill !== null ? (
+            <>
+              Regen <span className="text-zinc-300">{kRefill}</span>/min
+              <span className="ml-1 text-zinc-600">(Keepa)</span>
+            </>
+          ) : (
+            <span>Regen/min after next live Keepa response</span>
+          )}
+          {kLeft !== null ? (
+            <>
+              {" "}
+              · left <span className="text-zinc-300">{kLeft}</span>
+            </>
+          ) : null}
+        </span>
+      </div>
+      <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
+        {multi ? (
+          <>
+            Multiple uploads run at the same time and{" "}
+            <strong className="font-medium text-amber-100/90">
+              share the same Keepa token budget and API limits
+            </strong>
+            , so each job may finish slower than when you are the only one running.
+          </>
+        ) : (
+          <>
+            Keepa limits tokens per minute; if this feels slow while you are testing, check that
+            only one browser tab is processing a file, or wait for other active jobs to finish.
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
 const PHASE_ORDER = [
   "parse",
   "sheet_domain",
@@ -171,6 +287,8 @@ export default function HomeClient() {
   const [comebackJobId, setComebackJobId] = useState<string | null>(null);
   const [historyRefreshTick, setHistoryRefreshTick] = useState(0);
   const [runConsoleKey, setRunConsoleKey] = useState(0);
+  const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
+  const [queueFetchError, setQueueFetchError] = useState(false);
   const cancelledRef = useRef(false);
 
   useEffect(() => {
@@ -179,6 +297,53 @@ export default function HomeClient() {
       cancelledRef.current = true;
     };
   }, []);
+
+  const busyProcess = busy === "process";
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const fetchStats = async () => {
+      try {
+        const r = await fetch(`${apiBase()}/api/v1/process/queue-stats`);
+        if (!r.ok) throw new Error(String(r.status));
+        const j = (await r.json()) as Partial<QueueStats>;
+        if (
+          typeof j.active === "number" &&
+          typeof j.queued === "number" &&
+          typeof j.running === "number"
+        ) {
+          setQueueStats({
+            jobs_in_memory: Number(j.jobs_in_memory) || 0,
+            active: j.active,
+            queued: j.queued,
+            running: j.running,
+            complete: Number(j.complete) || 0,
+            error: Number(j.error) || 0,
+            keepa_tokens_consumed_last_60s:
+              Number(j.keepa_tokens_consumed_last_60s) || 0,
+            keepa_live_calls_last_60s: Number(j.keepa_live_calls_last_60s) || 0,
+            keepa_tokens_left_last:
+              typeof j.keepa_tokens_left_last === "number"
+                ? j.keepa_tokens_left_last
+                : null,
+            keepa_refill_rate_last:
+              typeof j.keepa_refill_rate_last === "number"
+                ? j.keepa_refill_rate_last
+                : null,
+          });
+          setQueueFetchError(false);
+        }
+      } catch {
+        setQueueFetchError(true);
+      }
+    };
+    void fetchStats();
+    const ms = busyProcess ? 2000 : QUEUE_POLL_MS;
+    timer = setInterval(fetchStats, ms);
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [busyProcess]);
 
   const pollJob = useCallback(
     async (jobId: string, filenameFallback: string, isResume: boolean) => {
@@ -336,6 +501,7 @@ export default function HomeClient() {
       </div>
 
       <div className="relative z-10 mx-auto max-w-5xl px-4 pb-20 pt-8 md:px-8 md:pt-12">
+        <ServerQueueBanner stats={queueStats} fetchError={queueFetchError} />
         <header className="mb-10 md:mb-14">
           <div className="flex items-center gap-5 md:gap-8">
             <div

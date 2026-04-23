@@ -28,6 +28,7 @@ if __package__:
         set_cached_keepa_by_code,
         set_cached_keepa_product,
     )
+    from .keepa_telemetry import record_keepa_response
 else:
     from cache import (
         Cache,
@@ -36,6 +37,7 @@ else:
         set_cached_keepa_by_code,
         set_cached_keepa_product,
     )
+    from keepa_telemetry import record_keepa_response
 
 KEEPA_API_BASE = "https://api.keepa.com"
 KEEPA_PRODUCT_URL = f"{KEEPA_API_BASE}/product"
@@ -215,6 +217,7 @@ def fetch_keepa_product(
         )
 
     _raise_if_error(data)
+    record_keepa_response(data)
     if on_response:
         on_response(data)
     if throttle:
@@ -291,6 +294,7 @@ def fetch_keepa_products_batch(
             )
 
         _raise_if_error(data)
+        record_keepa_response(data)
         if on_response:
             on_response(data)
         if throttle:
@@ -363,6 +367,7 @@ def fetch_keepa_product_by_code(
         )
 
     _raise_if_error(data)
+    record_keepa_response(data)
     if on_response:
         on_response(data)
     if throttle:
@@ -417,6 +422,7 @@ def product_finder_asins(
         )
 
     _raise_if_error(data)
+    record_keepa_response(data)
     if on_response:
         on_response(data)
     if throttle:
