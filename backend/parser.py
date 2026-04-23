@@ -17,6 +17,7 @@ from typing import Any, Optional
 import httpx
 from openpyxl import load_workbook
 
+from backend.anthropic_usage import AnthropicUsageLedger, record_anthropic_messages_response
 from backend.ollama_usage import OllamaTokenLedger, record_chat_response
 
 if __package__:
@@ -340,6 +341,7 @@ def _anthropic_sheet_understanding(
     api_key: str,
     model: str,
     timeout: float = 120.0,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> tuple[Optional[int], dict[str, Optional[str]]]:
     prompt, _schema = _llm_prompt_block(rows_preview, guessed_header_1based, headers_if_guess)
     url = "https://api.anthropic.com/v1/messages"
@@ -359,6 +361,7 @@ def _anthropic_sheet_understanding(
             snippet = (r.text or "").strip().replace("\n", " ")[:600]
             raise RuntimeError(f"Anthropic HTTP {r.status_code}: {snippet or r.reason_phrase}")
         data = r.json()
+        record_anthropic_messages_response(anthropic_usage, data)
     parts = data.get("content") or []
     text = ""
     for p in parts:
@@ -410,6 +413,7 @@ def _parse_sheet_matrix(
     haiku_model: str,
     timeout: float,
     ollama_usage: Optional[OllamaTokenLedger] = None,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> ParseResult:
     if not raw:
         return ParseResult(
@@ -440,6 +444,7 @@ def _parse_sheet_matrix(
                     api_key=anthropic_api_key.strip(),
                     model=haiku_model or "claude-haiku-4-5-20251001",
                     timeout=min(timeout, 120.0),
+                    anthropic_usage=anthropic_usage,
                 )
                 method = "haiku"
                 llm_ok = True
@@ -553,6 +558,7 @@ def parse_uploaded_file(
     anthropic_api_key: str = "",
     haiku_model: str = "claude-haiku-4-5-20251001",
     ollama_usage: Optional[OllamaTokenLedger] = None,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> ParseResult:
     fn = (filename or "upload").lower()
     if fn.endswith(".csv"):
@@ -568,6 +574,7 @@ def parse_uploaded_file(
             haiku_model=haiku_model,
             timeout=timeout,
             ollama_usage=ollama_usage,
+            anthropic_usage=anthropic_usage,
         )
 
     wb = load_workbook(filename=BytesIO(data), read_only=True, data_only=True)
@@ -611,6 +618,7 @@ def parse_uploaded_file(
                 haiku_model=haiku_model,
                 timeout=timeout,
                 ollama_usage=ollama_usage,
+                anthropic_usage=anthropic_usage,
             )
             merged.extend(sub.rows)
             if len(sub.rows) > best_n:
@@ -651,6 +659,7 @@ def _parse_csv_bytes(
     haiku_model: str,
     timeout: float,
     ollama_usage: Optional[OllamaTokenLedger] = None,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> ParseResult:
     text = data.decode("utf-8-sig", errors="replace")
     sample = text[:4096]
@@ -673,6 +682,7 @@ def _parse_csv_bytes(
         haiku_model=haiku_model,
         timeout=timeout,
         ollama_usage=ollama_usage,
+        anthropic_usage=anthropic_usage,
     )
 
 
@@ -686,6 +696,7 @@ def parse_workbook_bytes(
     anthropic_api_key: str = "",
     haiku_model: str = "claude-haiku-4-5-20251001",
     ollama_usage: Optional[OllamaTokenLedger] = None,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> ParseResult:
     return parse_uploaded_file(
         xlsx_bytes,
@@ -697,6 +708,7 @@ def parse_workbook_bytes(
         anthropic_api_key=anthropic_api_key,
         haiku_model=haiku_model,
         ollama_usage=ollama_usage,
+        anthropic_usage=anthropic_usage,
     )
 
 

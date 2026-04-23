@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.cache import Cache
+from backend.anthropic_usage import AnthropicUsageLedger
 from backend.keepa_telemetry import get_keepa_telemetry
 from backend.lookup import (
     KeepaError,
@@ -356,6 +357,7 @@ def run_process_pipeline(
     progress: ProgressCb,
     use_ollama_asin_validate: bool = True,
     on_row_count: RowCountCb = None,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> tuple[BytesIO, str, dict[str, Any]]:
     def p(phase: str, message: str, current: int = 0, total: int = 0) -> None:
         if progress:
@@ -363,6 +365,7 @@ def run_process_pipeline(
 
     t0 = time.perf_counter()
     ollama_usage = OllamaTokenLedger()
+    anthropic_ledger = anthropic_usage if anthropic_usage is not None else AnthropicUsageLedger()
 
     validate_queue: list[
         tuple[dict[str, Any], dict[str, Any], str, str, dict[str, Any], str, str]
@@ -380,6 +383,7 @@ def run_process_pipeline(
             anthropic_api_key=settings.anthropic_api_key,
             haiku_model=settings.haiku_model,
             ollama_usage=ollama_usage,
+            anthropic_usage=anthropic_ledger,
         )
     except Exception as e:
         raise RuntimeError(f"Failed to parse file: {e}") from e
@@ -404,6 +408,7 @@ def run_process_pipeline(
         timeout=float(settings.ollama_asin_validate_timeout_sec),
         progress=p,
         ollama_usage=ollama_usage,
+        anthropic_usage=anthropic_ledger,
     )
 
     cache = get_cache()
@@ -554,6 +559,7 @@ def run_process_pipeline(
                 use_ollama_resolver_gemma=settings.use_ollama_resolver_gemma,
                 source_file_hint=str(row0.get("_source_file_hint") or "").strip() or None,
                 ollama_usage=ollama_usage,
+                anthropic_usage=anthropic_ledger,
             )
             sku_results[sk] = (prod, reason)
         except Exception as e:
@@ -670,6 +676,7 @@ def run_process_pipeline(
                         amazon_brand=kb,
                         source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
                         timeout=tmo,
+                        anthropic_usage=anthropic_ledger,
                     )
                 else:
                     verdict, note = ollama_validate_asin_vs_description(
@@ -730,6 +737,7 @@ def run_process_pipeline(
     download_name = base_fn + "_trasco_results.xlsx"
     p("done", "Done.", 1, 1)
     stats: dict[str, Any] = dict(ollama_usage.to_stats_dict())
+    stats.update(anthropic_ledger.to_stats_dict())
     stats["duration_sec"] = round(time.perf_counter() - t0, 3)
     return buf, download_name, stats
 
@@ -749,6 +757,10 @@ class ProcessJob:
     ollama_completion_tokens: int = 0
     ollama_total_tokens: int = 0
     ollama_requests: int = 0
+    anthropic_input_tokens: int = 0
+    anthropic_output_tokens: int = 0
+    anthropic_total_tokens: int = 0
+    anthropic_requests: int = 0
     source_filename: Optional[str] = None
     started_at: float = field(default_factory=time.time)
     row_count: int = 0
@@ -810,6 +822,10 @@ def _job_snapshot(job: ProcessJob) -> dict[str, Any]:
             "row_count": job.row_count,
             "elapsed_sec": elapsed,
         }
+        snap["anthropic_input_tokens"] = job.anthropic_input_tokens
+        snap["anthropic_output_tokens"] = job.anthropic_output_tokens
+        snap["anthropic_total_tokens"] = job.anthropic_total_tokens
+        snap["anthropic_requests"] = job.anthropic_requests
         if job.status == "complete":
             snap["duration_sec"] = job.duration_sec
             snap["ollama_prompt_tokens"] = job.ollama_prompt_tokens
@@ -833,13 +849,20 @@ async def _run_process_job(
     if job is None:
         return
 
+    anthropic_ledger = AnthropicUsageLedger()
+
     def progress(phase: str, message: str, current: int, total: int) -> None:
+        au = anthropic_ledger.to_stats_dict()
         with job.lock:
             job.status = "running"
             job.phase = phase
             job.message = message
             job.current = current
             job.total = total
+            job.anthropic_input_tokens = int(au.get("anthropic_input_tokens") or 0)
+            job.anthropic_output_tokens = int(au.get("anthropic_output_tokens") or 0)
+            job.anthropic_total_tokens = int(au.get("anthropic_total_tokens") or 0)
+            job.anthropic_requests = int(au.get("anthropic_requests") or 0)
 
     def set_row_count(n: int) -> None:
         with job.lock:
@@ -855,6 +878,7 @@ async def _run_process_job(
             progress=progress,
             use_ollama_asin_validate=use_ollama_asin_validate,
             on_row_count=set_row_count,
+            anthropic_usage=anthropic_ledger,
         )
         xlsx_bytes = buf.getvalue()
         path = save_result_xlsx(job_id, xlsx_bytes)
@@ -869,6 +893,10 @@ async def _run_process_job(
                 "ollama_completion_tokens": int(stats.get("ollama_completion_tokens") or 0),
                 "ollama_total_tokens": int(stats.get("ollama_total_tokens") or 0),
                 "ollama_requests": int(stats.get("ollama_requests") or 0),
+                "anthropic_input_tokens": int(stats.get("anthropic_input_tokens") or 0),
+                "anthropic_output_tokens": int(stats.get("anthropic_output_tokens") or 0),
+                "anthropic_total_tokens": int(stats.get("anthropic_total_tokens") or 0),
+                "anthropic_requests": int(stats.get("anthropic_requests") or 0),
             }
         )
         with job.lock:
@@ -886,6 +914,10 @@ async def _run_process_job(
             job.ollama_completion_tokens = int(stats.get("ollama_completion_tokens") or 0)
             job.ollama_total_tokens = int(stats.get("ollama_total_tokens") or 0)
             job.ollama_requests = int(stats.get("ollama_requests") or 0)
+            job.anthropic_input_tokens = int(stats.get("anthropic_input_tokens") or 0)
+            job.anthropic_output_tokens = int(stats.get("anthropic_output_tokens") or 0)
+            job.anthropic_total_tokens = int(stats.get("anthropic_total_tokens") or 0)
+            job.anthropic_requests = int(stats.get("anthropic_requests") or 0)
     except Exception as e:
         with job.lock:
             job.status = "error"
@@ -1001,6 +1033,10 @@ def process_status(job_id: str) -> dict[str, Any]:
                     "duration_sec": float(entry.get("duration_sec") or 0),
                     "source_filename": entry.get("source_filename"),
                     "download_name": entry.get("download_name"),
+                    "anthropic_input_tokens": int(entry.get("anthropic_input_tokens") or 0),
+                    "anthropic_output_tokens": int(entry.get("anthropic_output_tokens") or 0),
+                    "anthropic_total_tokens": int(entry.get("anthropic_total_tokens") or 0),
+                    "anthropic_requests": int(entry.get("anthropic_requests") or 0),
                 }
     raise HTTPException(404, "Unknown job_id.")
 

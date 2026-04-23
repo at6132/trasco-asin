@@ -17,6 +17,7 @@ from typing import Any, Callable, Literal, Optional
 
 import httpx
 
+from backend.anthropic_usage import AnthropicUsageLedger, record_anthropic_messages_response
 from backend.ollama_usage import OllamaTokenLedger, record_chat_response
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ def _anthropic_first_message_text(
     max_tokens: int,
     timeout: float,
     max_rate_limit_retries: int = _DEFAULT_ANTHROPIC_RATE_LIMIT_RETRIES,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> str:
     """POST /v1/messages and concatenate assistant text blocks.
 
@@ -102,6 +104,7 @@ def _anthropic_first_message_text(
             r = client.post(url, json=body, headers=headers)
         if r.status_code < 400:
             data = r.json()
+            record_anthropic_messages_response(anthropic_usage, data)
             break
         snippet = (r.text or "").strip().replace("\n", " ")[:400]
         transient = r.status_code == 429 or r.status_code == 529
@@ -225,6 +228,7 @@ def haiku_validate_asin_vs_description(
     amazon_brand: Optional[str],
     source_file_hint: Optional[str] = None,
     timeout: float = 120.0,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> tuple[Verdict, str]:
     """
     Same contract as ``ollama_validate_asin_vs_description``: Claude Haiku decides same_product.
@@ -247,6 +251,7 @@ def haiku_validate_asin_vs_description(
             prompt,
             max_tokens=512,
             timeout=min(float(timeout), 120.0),
+            anthropic_usage=anthropic_usage,
         )
     except Exception as e:
         logger.warning("Haiku ASIN validate request failed: %s", e)
@@ -367,6 +372,7 @@ def haiku_pick_asin_from_candidates(
     source_file_hint: Optional[str] = None,
     candidates: list[tuple[str, str]],
     timeout: float = 90.0,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> Optional[str]:
     """Claude Haiku: same JSON contract as ``ollama_pick_asin_from_candidates``."""
     prompt, asin_set = _finder_pick_asin_prompt_and_asins(
@@ -379,7 +385,12 @@ def haiku_pick_asin_from_candidates(
         return None
     try:
         text = _anthropic_first_message_text(
-            api_key, model, prompt, max_tokens=512, timeout=min(float(timeout), 120.0)
+            api_key,
+            model,
+            prompt,
+            max_tokens=512,
+            timeout=min(float(timeout), 120.0),
+            anthropic_usage=anthropic_usage,
         )
     except Exception as e:
         logger.warning("Haiku pick-asin failed: %s", e)
@@ -485,6 +496,7 @@ def haiku_suggest_finder_escalations(
     source_file_hint: Optional[str] = None,
     attempts_tried: str,
     timeout: float = 90.0,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> tuple[list[str], list[str]]:
     """Claude Haiku: same contract as ``ollama_suggest_finder_escalations``."""
     prompt = _finder_escalation_user_prompt(
@@ -496,7 +508,12 @@ def haiku_suggest_finder_escalations(
     )
     try:
         text = _anthropic_first_message_text(
-            api_key, model, prompt, max_tokens=1024, timeout=min(float(timeout), 120.0)
+            api_key,
+            model,
+            prompt,
+            max_tokens=1024,
+            timeout=min(float(timeout), 120.0),
+            anthropic_usage=anthropic_usage,
         )
     except Exception as e:
         logger.warning("Haiku finder-escalation suggest failed: %s", e)
@@ -593,6 +610,7 @@ def haiku_infer_keepa_domain(
     *,
     default_domain: int,
     timeout: float = 75.0,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> int:
     """Claude Haiku: same task as ``ollama_infer_keepa_domain``."""
     prompt = _keepa_domain_user_prompt(sample_text)
@@ -600,7 +618,12 @@ def haiku_infer_keepa_domain(
         return default_domain
     try:
         text = _anthropic_first_message_text(
-            api_key, model, prompt, max_tokens=256, timeout=min(float(timeout), 120.0)
+            api_key,
+            model,
+            prompt,
+            max_tokens=256,
+            timeout=min(float(timeout), 120.0),
+            anthropic_usage=anthropic_usage,
         )
     except Exception as e:
         logger.warning("Haiku keepa-domain inference failed: %s", e)
@@ -674,6 +697,7 @@ def assign_keepa_domains_to_rows(
     timeout: float,
     progress: Optional[Callable[[str, str, int, int], None]] = None,
     ollama_usage: Optional[OllamaTokenLedger] = None,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> None:
     """Sets ``row['_keepa_domain']`` (int) for every row, grouped by ``_sheet_name``."""
     by_sheet: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -714,6 +738,7 @@ def assign_keepa_domains_to_rows(
                 haiku_model or "claude-haiku-4-5-20251001",
                 default_domain=int(default_domain),
                 timeout=min(float(timeout), 120.0),
+                anthropic_usage=anthropic_usage,
             )
         else:
             dom = ollama_infer_keepa_domain(

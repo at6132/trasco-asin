@@ -24,6 +24,7 @@ from backend.ollama_asin_validate import (
     ollama_suggest_finder_escalations,
     ollama_tags_reachable,
 )
+from backend.anthropic_usage import AnthropicUsageLedger
 from backend.ollama_usage import OllamaTokenLedger
 from backend.validator import title_similarity
 
@@ -151,6 +152,7 @@ def _run_one_finder_attempt(
     use_llm_pick: bool,
     anthropic_api_key: Optional[str] = None,
     haiku_model: str = "",
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> Optional[tuple[dict[str, Any], str, float, str]]:
     """
     Returns (product, reason_suffix, finder_score, finder_how) or None.
@@ -193,6 +195,7 @@ def _run_one_finder_attempt(
             source_file_hint=source_file_hint,
             candidates=rows,
             timeout=min(ollama_timeout_sec, 120.0),
+            anthropic_usage=anthropic_usage,
         )
         if picked and prods.get(picked):
             return prods[picked], f"{label}:haiku_pick", 1.0, "haiku_pick"
@@ -235,6 +238,7 @@ def resolve_via_product_finder(
     use_ollama_resolver_gemma: bool = True,
     source_file_hint: Optional[str] = None,
     ollama_usage: Optional[OllamaTokenLedger] = None,
+    anthropic_usage: Optional[AnthropicUsageLedger] = None,
 ) -> tuple[Optional[dict[str, Any]], str]:
     """
     Returns (product_dict or None, reason_code).
@@ -304,6 +308,7 @@ def resolve_via_product_finder(
                 use_llm_pick=use_llm_pick,
                 anthropic_api_key=anthropic_api_key,
                 haiku_model=haiku_model,
+                anthropic_usage=anthropic_usage,
             )
             if hit:
                 return _cache_hit(hit)
@@ -323,6 +328,7 @@ def resolve_via_product_finder(
             source_file_hint=source_file_hint,
             attempts_tried=trace[:500],
             timeout=min(ollama_timeout_sec, 120.0),
+            anthropic_usage=anthropic_usage,
         )
     elif use_llm_pick and obase and ollama_tags_reachable(obase):
         trace = ",".join(tried_labels) + "|" + (last_err or "")
@@ -375,6 +381,7 @@ def resolve_via_product_finder(
                     use_llm_pick=use_llm_pick,
                     anthropic_api_key=anthropic_api_key,
                     haiku_model=haiku_model,
+                    anthropic_usage=anthropic_usage,
                 )
                 if hit:
                     return _cache_hit(hit)

@@ -28,6 +28,10 @@ type ProcessStatus = {
   ollama_completion_tokens?: number;
   ollama_total_tokens?: number;
   ollama_requests?: number;
+  anthropic_input_tokens?: number;
+  anthropic_output_tokens?: number;
+  anthropic_total_tokens?: number;
+  anthropic_requests?: number;
   source_filename?: string | null;
   download_name?: string | null;
 };
@@ -764,7 +768,55 @@ function ProcessProgressDeck(props: { status: ProcessStatus }) {
           {formatDuration(elapsed)} elapsed
         </p>
       ) : null}
+      <ClaudeRunMetrics status={status} elapsed={elapsed} isDone={isDone} />
     </section>
+  );
+}
+
+function ClaudeRunMetrics(props: {
+  status: ProcessStatus;
+  elapsed: number;
+  isDone: boolean;
+}) {
+  const { status, elapsed, isDone } = props;
+  const req = Number(status.anthropic_requests) || 0;
+  const inTok = Number(status.anthropic_input_tokens) || 0;
+  const outTok = Number(status.anthropic_output_tokens) || 0;
+  const total = Number(status.anthropic_total_tokens) || inTok + outTok;
+  if (req <= 0 && total <= 0) {
+    return null;
+  }
+  const secForRate = isDone ? Math.max(elapsed, 0.001) : Math.max(elapsed, 5);
+  const rpm =
+    req > 0 ? Math.round(((req * 60) / secForRate) * 10) / 10 : 0;
+
+  return (
+    <div className="mt-4 rounded-xl border border-violet-500/20 bg-violet-950/20 px-3 py-2.5 text-[11px] text-zinc-400">
+      <div className="font-medium text-violet-200/90">Claude (Haiku) — this run</div>
+      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 tabular-nums">
+        <span>
+          <span className="text-zinc-500">Tokens</span>{" "}
+          <span className="text-zinc-200">{total.toLocaleString()}</span>
+          {inTok > 0 || outTok > 0 ? (
+            <span className="text-zinc-600">
+              {" "}
+              ({inTok.toLocaleString()} in / {outTok.toLocaleString()} out)
+            </span>
+          ) : null}
+        </span>
+        <span>
+          <span className="text-zinc-500">API calls</span>{" "}
+          <span className="text-zinc-200">{req}</span>
+        </span>
+        <span>
+          <span className="text-zinc-500">Calls/min</span>{" "}
+          <span className="text-zinc-200">{rpm}</span>
+          {!isDone && elapsed < 5 ? (
+            <span className="text-zinc-600"> (pace until 5s elapsed)</span>
+          ) : null}
+        </span>
+      </div>
+    </div>
   );
 }
 
