@@ -65,9 +65,57 @@ function formatDuration(sec: number): string {
 
 function formatEta(sec: number): string {
   if (!Number.isFinite(sec) || sec <= 0) return "";
-  if (sec < 60) return `~${Math.ceil(sec)}s remaining`;
+  if (sec < 60) return `~${Math.ceil(sec)}s left`;
   const m = Math.ceil(sec / 60);
-  return `~${m} min remaining`;
+  return `~${m} min left`;
+}
+
+function estimateRemainingSeconds(
+  liveElapsed: number,
+  phase: string,
+  current: number,
+  total: number,
+  rowCount: number,
+): number | null {
+  if (phase === "done" || phase === "error") return null;
+  if (total > 0 && current > 0) {
+    const rate = liveElapsed / current;
+    if (!Number.isFinite(rate) || rate < 0) return null;
+    return Math.max(0, (total - current) * rate);
+  }
+  if (rowCount > 0 && liveElapsed > 5) {
+    const estimatedTotal = rowCount * 1.2;
+    return Math.max(0, estimatedTotal - liveElapsed);
+  }
+  return null;
+}
+
+function formatEasternCompletion(remainingSec: number): string {
+  if (!Number.isFinite(remainingSec) || remainingSec < 0) return "";
+  const when = new Date(Date.now() + remainingSec * 1000);
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "2-digit",
+    second: remainingSec < 120 ? "2-digit" : undefined,
+    timeZoneName: "short",
+  }).format(when);
+}
+
+function useLiveElapsed(serverElapsedSec: number, shouldTick: boolean): number {
+  const anchor = useRef({ s: serverElapsedSec, t: Date.now() });
+  const lastServer = useRef<number | undefined>(undefined);
+  const [, setTick] = useState(0);
+  if (lastServer.current !== serverElapsedSec) {
+    lastServer.current = serverElapsedSec;
+    anchor.current = { s: serverElapsedSec, t: Date.now() };
+  }
+  useEffect(() => {
+    if (!shouldTick) return;
+    const id = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [shouldTick]);
+  return anchor.current.s + (Date.now() - anchor.current.t) / 1000;
 }
 
 const ProcessHistoryPanel = dynamic(
@@ -173,21 +221,47 @@ function ProcessingDashboard(props: {
   const activeIdx = phaseIndex(status.phase);
   const isDone = status.phase === "done";
   const phaseLabel = phaseUserLabel(status.phase);
-  const elapsed = Number(status.elapsed_sec) || 0;
+  const serverElapsed = Number(status.elapsed_sec) || 0;
   const rowCount = Number(status.row_count) || 0;
+  const shouldTickEta =
+    !isDone && status.phase !== "error" && status.status !== "complete";
+  const liveElapsed = useLiveElapsed(serverElapsed, shouldTickEta);
+  const remainingSec = !isDone
+    ? estimateRemainingSeconds(
+        liveElapsed,
+        status.phase,
+        status.current,
+        status.total,
+        rowCount,
+      )
+    : null;
   let etaText = "";
-  if (!isDone && rowCount > 0 && elapsed > 5) {
-    const secPerRow = 1.2;
-    const estimatedTotal = rowCount * secPerRow;
-    const remaining = Math.max(0, estimatedTotal - elapsed);
-    etaText = formatEta(remaining);
+  if (remainingSec !== null && !isDone) {
+    if (remainingSec < 1.5) {
+      etaText = "Finishing…";
+    } else {
+      const partA = formatEta(remainingSec);
+      const partB = formatEasternCompletion(remainingSec);
+      if (partA && partB) {
+        etaText = `${partA} · est. ${partB}`;
+      } else if (partB) {
+        etaText = `est. ${partB}`;
+      }
+    }
   }
+  const displayElapsed = shouldTickEta
+    ? liveElapsed
+    : Number(status.duration_sec) > 0
+      ? Number(status.duration_sec)
+      : serverElapsed;
 
   const aReq = Number(status.anthropic_requests) || 0;
   const aIn = Number(status.anthropic_input_tokens) || 0;
   const aOut = Number(status.anthropic_output_tokens) || 0;
   const aTotal = Number(status.anthropic_total_tokens) || aIn + aOut;
-  const secForClaude = isDone ? Math.max(elapsed, 0.001) : Math.max(elapsed, 5);
+  const secForClaude = isDone
+    ? Math.max(displayElapsed, 0.001)
+    : Math.max(liveElapsed, 5);
   const claudeRpm =
     aReq > 0 ? Math.round(((aReq * 60) / secForClaude) * 10) / 10 : 0;
 
@@ -238,9 +312,9 @@ function ProcessingDashboard(props: {
             <span className="rounded-full border border-cyan-500/35 bg-cyan-500/15 px-3 py-1 text-xs font-medium text-cyan-100">
               {phaseLabel}
             </span>
-            {elapsed > 0 ? (
+            {displayElapsed > 0 ? (
               <span className="text-[11px] tabular-nums text-zinc-500">
-                {formatDuration(elapsed)}
+                {formatDuration(displayElapsed)}
               </span>
             ) : null}
           </div>
@@ -317,11 +391,6 @@ function ProcessingDashboard(props: {
                     </>
                   ) : null}
                 </p>
-                <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
-                  Sum of Keepa&apos;s <code className="rounded bg-slate-900/80 px-1 text-zinc-400">tokensConsumed</code>{" "}
-                  per live response. One batch product call can charge many tokens; SKU finder runs several calls per
-                  SKU.
-                </p>
               </>
             ) : (
               <p className="text-zinc-500">Loading…</p>
@@ -343,7 +412,7 @@ function ProcessingDashboard(props: {
                     : null}
                   {aReq} call{aReq !== 1 ? "s" : ""} ·{" "}
                   <span className="text-zinc-300">{claudeRpm}</span>/min
-                  {!isDone && elapsed < 5 ? (
+                  {!isDone && liveElapsed < 5 ? (
                     <span className="text-zinc-600"> (pace stabilizes ≥5s)</span>
                   ) : null}
                 </p>
@@ -380,11 +449,6 @@ function ProcessingDashboard(props: {
                 <span className="text-zinc-300">{kpC}</span>
                 <span className="text-zinc-500"> active / pool cap</span>
               </p>
-              <p className="text-[11px] leading-relaxed text-zinc-500">
-                Parallel GTIN, SKU finder, and multi-domain ASIN batches. Workers burst as fast
-                as possible; pacing is reactive — workers pause only when Keepa reports low tokens
-                or returns HTTP 429.
-              </p>
             </MetricCard>
             <MetricCard title="LLM workers (this job)" accent="violet">
               <p className="tabular-nums">
@@ -392,10 +456,6 @@ function ProcessingDashboard(props: {
                 <span className="text-zinc-500"> / </span>
                 <span className="text-zinc-300">{lpC}</span>
                 <span className="text-zinc-500"> active / pool cap</span>
-              </p>
-              <p className="text-[11px] leading-relaxed text-zinc-500">
-                Haiku ASIN validation workers fire as fast as possible. If Anthropic returns
-                HTTP 429, each request retries with exponential backoff (up to 12 attempts).
               </p>
             </MetricCard>
           </div>
@@ -483,10 +543,6 @@ function ServerQueueBanner(props: { stats: QueueStats | null; fetchError: boolea
 
   const { active, queued, running, jobs_in_memory } = stats;
   const multi = active > 1;
-  const k60 = stats.keepa_tokens_consumed_last_60s;
-  const kCalls = stats.keepa_live_calls_last_60s;
-  const kLeft = stats.keepa_tokens_left_last;
-  const kRefill = stats.keepa_refill_rate_last;
 
   return (
     <div
@@ -515,51 +571,11 @@ function ServerQueueBanner(props: { stats: QueueStats | null; fetchError: boolea
           {jobs_in_memory} job{jobs_in_memory !== 1 ? "s" : ""} in memory
         </span>
       </div>
-      <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-t border-white/10 pt-2 text-[11px] text-zinc-400">
-        <span>
-          <span className="text-zinc-500">Keepa (server, rolling 60s):</span>{" "}
-          <span className="tabular-nums font-medium text-emerald-200/90">{k60}</span>{" "}
-          <span className="text-zinc-500">
-            billing tokens
-            {kCalls > 0 ? (
-              <>
-                {" "}
-                ({kCalls} live {kCalls !== 1 ? "calls" : "call"} — batches cost more than one)
-              </>
-            ) : null}
-            ; not the same as rows or SKUs finished
-          </span>
-        </span>
-        <span className="tabular-nums text-zinc-500">
-          {kRefill !== null ? (
-            <>
-              Regen <span className="text-zinc-300">{kRefill}</span>/min
-              <span className="ml-1 text-zinc-600">(Keepa)</span>
-            </>
-          ) : (
-            <span>Regen/min after next live Keepa response</span>
-          )}
-          {kLeft !== null ? (
-            <>
-              {" "}
-              · left <span className="text-zinc-300">{kLeft}</span>
-            </>
-          ) : null}
-        </span>
-      </div>
-      <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
-        {multi ? (
-          <>
-            Multiple uploads share the same Keepa API key — workers from all jobs
-            burst together and pause together when the server signals low tokens.
-          </>
-        ) : (
-          <>
-            Workers burst as fast as the Keepa API allows, pausing only when the server
-            reports low tokens or returns 429.
-          </>
-        )}
-      </p>
+      {multi ? (
+        <p className="mt-1.5 text-xs leading-relaxed text-zinc-400 border-t border-white/10 pt-2">
+          Multiple uploads share the same API limits — each job may be slower when others are running.
+        </p>
+      ) : null}
     </div>
   );
 }
