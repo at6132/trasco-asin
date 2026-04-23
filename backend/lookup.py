@@ -7,9 +7,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -72,7 +72,34 @@ class KeepaError(Exception):
     pass
 
 
-_KEEPA_RATE_LIMIT_MAX_RETRIES = 12
+_KEEPA_RATE_LIMIT_MAX_RETRIES = 15
+# Minimum wall-clock wait between 429/503 attempts; all workers share one deadline.
+_KEEPA_RL_MIN_WAIT_SEC = 60.0
+_KEEPA_SHARED_RL_COND = threading.Condition()
+_KEEPA_SHARED_RL_UNTIL: float = 0.0
+
+
+def _await_keepa_shared_rl() -> None:
+    """All Keepa call paths block here until a process-wide 429/503 cooldown ends."""
+    with _KEEPA_SHARED_RL_COND:
+        while time.time() < _KEEPA_SHARED_RL_UNTIL:
+            remaining = _KEEPA_SHARED_RL_UNTIL - time.time()
+            _KEEPA_SHARED_RL_COND.wait(timeout=max(remaining, 0.05))
+
+
+def _bump_and_wait_keepa_shared_rl(wait_sec: float) -> None:
+    """
+    A 429/503 extends the shared wait to at least ``wait_sec`` from now (max with any
+    in-flight wait). This thread and every other thread must wait it out in harmony.
+    """
+    global _KEEPA_SHARED_RL_UNTIL
+    with _KEEPA_SHARED_RL_COND:
+        new_end = time.time() + max(0.0, wait_sec)
+        _KEEPA_SHARED_RL_UNTIL = max(_KEEPA_SHARED_RL_UNTIL, new_end)
+        _KEEPA_SHARED_RL_COND.notify_all()
+        while time.time() < _KEEPA_SHARED_RL_UNTIL:
+            remaining = _KEEPA_SHARED_RL_UNTIL - time.time()
+            _KEEPA_SHARED_RL_COND.wait(timeout=max(remaining, 0.05))
 
 
 def _parse_retry_after_seconds(resp: httpx.Response) -> Optional[float]:
@@ -83,7 +110,7 @@ def _parse_retry_after_seconds(resp: httpx.Response) -> Optional[float]:
     try:
         sec = float(raw)
         if sec >= 0:
-            return min(120.0, sec)
+            return min(600.0, sec)
     except ValueError:
         pass
     try:
@@ -93,15 +120,10 @@ def _parse_retry_after_seconds(resp: httpx.Response) -> Optional[float]:
                 dt = dt.replace(tzinfo=timezone.utc)
             delta = (dt - datetime.now(timezone.utc)).total_seconds()
             if delta > 0:
-                return min(120.0, delta)
+                return min(600.0, delta)
     except Exception:
         pass
     return None
-
-
-def _keepa_backoff_after_rate_limit(attempt: int) -> float:
-    base = min(90.0, 2.0 * (1.55 ** max(0, attempt - 1)))
-    return base + random.uniform(0.15, 1.1)
 
 
 def _keepa_get_json(
@@ -113,34 +135,36 @@ def _keepa_get_json(
     max_retries: int = _KEEPA_RATE_LIMIT_MAX_RETRIES,
 ) -> dict[str, Any]:
     """
-    GET JSON from Keepa; on 429 (rate limit) or 503 (overload), wait and retry.
-    Uses ``Retry-After`` when present, else exponential backoff.
+    GET JSON from Keepa; on 429 (rate limit) or 503 (overload), all workers coordinate:
+    a shared wait of at least 60s (or longer if ``Retry-After`` says so), up to
+    ``max_retries`` per request before failing.
     """
     attempt = 0
     while True:
         attempt += 1
+        _await_keepa_shared_rl()
         r = client.get(url, params=params)
         transient = r.status_code == 429 or r.status_code == 503
         if transient:
             if attempt > max_retries:
                 snippet = (r.text or "").strip().replace("\n", " ")[:400]
                 raise KeepaError(
-                    f"HTTP {r.status_code} after {max_retries} retries ({context}): {snippet}"
+                    f"HTTP {r.status_code} after {max_retries} rate-limit tries ({context}): {snippet}"
                 )
-            wait = _parse_retry_after_seconds(r)
-            if wait is None:
-                wait = _keepa_backoff_after_rate_limit(attempt)
-            else:
-                wait = max(0.5, min(120.0, wait))
+            parsed = _parse_retry_after_seconds(r)
+            wait = max(
+                _KEEPA_RL_MIN_WAIT_SEC,
+                parsed if parsed is not None else 0.0,
+            )
             log.warning(
-                "Keepa HTTP %s — waiting %.1fs before retry %s/%s (%s)",
+                "Keepa HTTP %s — shared cooldown %.0fs+ then retry (attempt %s/%s) (%s)",
                 r.status_code,
-                wait,
+                _KEEPA_RL_MIN_WAIT_SEC,
                 attempt,
                 max_retries,
                 context,
             )
-            time.sleep(wait)
+            _bump_and_wait_keepa_shared_rl(wait)
             continue
         r.raise_for_status()
         data = r.json()
@@ -161,6 +185,7 @@ class KeepaThrottle:
         self._limiter = reactive_limiter
 
     def before_request(self) -> None:
+        _await_keepa_shared_rl()
         if self._limiter is not None:
             self._limiter.acquire()
 

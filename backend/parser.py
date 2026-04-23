@@ -17,7 +17,15 @@ from typing import Any, Optional
 import httpx
 from openpyxl import load_workbook
 
+from backend.anthropic_rl import (
+    ANTHROPIC_RATE_LIMIT_MAX_RETRIES,
+    ANTHROPIC_RL_MIN_WAIT_SEC,
+    await_anthropic_shared_rl,
+    bump_and_wait_anthropic_shared_rl,
+    parse_http_retry_after_seconds,
+)
 from backend.anthropic_usage import AnthropicUsageLedger, record_anthropic_messages_response
+from backend.http_pool import get_anthropic_client
 from backend.ollama_usage import OllamaTokenLedger, record_chat_response
 
 _MPN_FROM_TITLE_RE = re.compile(
@@ -371,13 +379,33 @@ def _anthropic_sheet_understanding(
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    with httpx.Client(timeout=timeout) as client:
-        r = client.post(url, json=body, headers=headers)
-        if r.status_code >= 400:
-            snippet = (r.text or "").strip().replace("\n", " ")[:600]
-            raise RuntimeError(f"Anthropic HTTP {r.status_code}: {snippet or r.reason_phrase}")
-        data = r.json()
-        record_anthropic_messages_response(anthropic_usage, data)
+    client = get_anthropic_client()
+    attempt = 0
+    data: dict[str, Any] = {}
+    while True:
+        attempt += 1
+        await_anthropic_shared_rl()
+        r = client.post(url, json=body, headers=headers, timeout=timeout)
+        if r.status_code < 400:
+            data = r.json()
+            record_anthropic_messages_response(anthropic_usage, data)
+            break
+        snippet = (r.text or "").strip().replace("\n", " ")[:600]
+        transient = r.status_code == 429 or r.status_code == 529
+        if transient and attempt <= ANTHROPIC_RATE_LIMIT_MAX_RETRIES:
+            parsed = parse_http_retry_after_seconds(r)
+            wait = max(
+                ANTHROPIC_RL_MIN_WAIT_SEC,
+                parsed if parsed is not None else 0.0,
+            )
+            bump_and_wait_anthropic_shared_rl(wait)
+            continue
+        if transient and attempt > ANTHROPIC_RATE_LIMIT_MAX_RETRIES:
+            raise RuntimeError(
+                f"Anthropic HTTP {r.status_code} after {ANTHROPIC_RATE_LIMIT_MAX_RETRIES} "
+                f"coordinated rate-limit attempts: {snippet or r.reason_phrase}"
+            )
+        raise RuntimeError(f"Anthropic HTTP {r.status_code}: {snippet or r.reason_phrase}")
     parts = data.get("content") or []
     text = ""
     for p in parts:
