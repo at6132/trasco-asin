@@ -10,13 +10,14 @@ import os
 import random
 import re
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional
 
 import httpx
+
+from backend.http_pool import get_keepa_client
 
 log = logging.getLogger(__name__)
 
@@ -149,41 +150,23 @@ def _keepa_get_json(
 
 
 class KeepaThrottle:
-    """Thread-safe spacing between live Keepa calls + token-aware backoff.
+    """Reactive throttle: burst as fast as possible, pause only when Keepa says tokens are low.
 
-    Optional ``token_bucket`` (e.g. ``TokenBucketLimiter``) enforces a target
-    requests-per-minute budget across parallel workers before the min-interval gate.
+    The shared ``KeepaReactiveLimiter`` reads ``tokensLeft`` / ``refillIn`` from
+    each response and pauses all threads when the account is near-empty.  HTTP 429s
+    are already retried inside ``_keepa_get_json``.  No proactive spacing.
     """
 
-    def __init__(
-        self,
-        min_interval_sec: float = 1.05,
-        *,
-        token_bucket: Optional[Any] = None,
-    ) -> None:
-        self._lock = threading.Lock()
-        self._last = 0.0
-        self.min_interval_sec = min_interval_sec
-        self._token_bucket = token_bucket
+    def __init__(self, *, reactive_limiter: Optional[Any] = None) -> None:
+        self._limiter = reactive_limiter
 
     def before_request(self) -> None:
-        if self._token_bucket is not None:
-            self._token_bucket.acquire()
-        with self._lock:
-            now = time.time()
-            gap = self.min_interval_sec - (now - self._last)
-            if gap > 0:
-                time.sleep(gap)
-            self._last = time.time()
+        if self._limiter is not None:
+            self._limiter.acquire()
 
     def after_response(self, data: dict[str, Any]) -> None:
-        if self._token_bucket is not None:
-            self._token_bucket.report_response(data)
-        tokens = data.get("tokensLeft")
-        refill_ms = data.get("refillIn")
-        if tokens is not None and tokens < 2 and refill_ms is not None:
-            wait = min(float(refill_ms) / 1000.0 + 0.25, 90.0)
-            time.sleep(wait)
+        if self._limiter is not None:
+            self._limiter.report_response(data)
 
 
 def _raise_if_error(data: dict[str, Any]) -> None:
@@ -222,13 +205,12 @@ def fetch_keepa_product(
         "stats": stats_days,
         "history": history,
     }
-    with httpx.Client(timeout=timeout) as client:
-        data = _keepa_get_json(
-            client,
-            KEEPA_PRODUCT_URL,
-            params,
-            context=f"product asin={asin} domain={domain}",
-        )
+    data = _keepa_get_json(
+        get_keepa_client(),
+        KEEPA_PRODUCT_URL,
+        params,
+        context=f"product asin={asin} domain={domain}",
+    )
 
     _raise_if_error(data)
     record_keepa_response(data)
@@ -299,13 +281,12 @@ def fetch_keepa_products_batch(
             "stats": stats_days,
             "history": history,
         }
-        with httpx.Client(timeout=timeout) as client:
-            data = _keepa_get_json(
-                client,
-                KEEPA_PRODUCT_URL,
-                params,
-                context=f"batch_product domain={domain} chunk={len(chunk)}",
-            )
+        data = _keepa_get_json(
+            get_keepa_client(),
+            KEEPA_PRODUCT_URL,
+            params,
+            context=f"batch_product domain={domain} chunk={len(chunk)}",
+        )
 
         _raise_if_error(data)
         record_keepa_response(data)
@@ -372,13 +353,12 @@ def fetch_keepa_product_by_code(
         "stats": stats_days,
         "history": history,
     }
-    with httpx.Client(timeout=timeout) as client:
-        data = _keepa_get_json(
-            client,
-            KEEPA_PRODUCT_URL,
-            params,
-            context=f"product_by_code domain={domain} code={digits}",
-        )
+    data = _keepa_get_json(
+        get_keepa_client(),
+        KEEPA_PRODUCT_URL,
+        params,
+        context=f"product_by_code domain={domain} code={digits}",
+    )
 
     _raise_if_error(data)
     record_keepa_response(data)
@@ -427,13 +407,12 @@ def product_finder_asins(
         "domain": domain,
         "selection": json.dumps(sel, separators=(",", ":")),
     }
-    with httpx.Client(timeout=timeout) as client:
-        data = _keepa_get_json(
-            client,
-            KEEPA_QUERY_URL,
-            payload,
-            context=f"product_finder domain={domain}",
-        )
+    data = _keepa_get_json(
+        get_keepa_client(),
+        KEEPA_QUERY_URL,
+        payload,
+        context=f"product_finder domain={domain}",
+    )
 
     _raise_if_error(data)
     record_keepa_response(data)

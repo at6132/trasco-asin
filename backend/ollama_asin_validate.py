@@ -18,6 +18,7 @@ from typing import Any, Callable, Literal, Optional
 import httpx
 
 from backend.anthropic_usage import AnthropicUsageLedger, record_anthropic_messages_response
+from backend.http_pool import get_anthropic_client
 from backend.ollama_usage import OllamaTokenLedger, record_chat_response
 
 logger = logging.getLogger(__name__)
@@ -100,8 +101,7 @@ def _anthropic_first_message_text(
     data: dict[str, Any] = {}
     while True:
         attempt += 1
-        with httpx.Client(timeout=timeout) as client:
-            r = client.post(url, json=body, headers=headers)
+        r = get_anthropic_client().post(url, json=body, headers=headers)
         if r.status_code < 400:
             data = r.json()
             record_anthropic_messages_response(anthropic_usage, data)

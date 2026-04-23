@@ -22,11 +22,7 @@ from io import BytesIO
 from typing import Any, Callable, Optional
 
 from backend.pipeline_metrics import PipelineSlotTracker
-from backend.global_rate_gates import (
-    get_shared_haiku_asin_validate_rpm_limiter,
-    get_shared_keepa_token_bucket,
-)
-from backend.rate_limiter import RpmLimiter, TokenBucketLimiter
+from backend.global_rate_gates import get_shared_keepa_reactive_limiter
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +31,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.cache import Cache
 from backend.anthropic_usage import AnthropicUsageLedger
+from backend.http_pool import close_pools
 from backend.keepa_telemetry import get_keepa_telemetry
 from backend.lookup import (
     KeepaError,
@@ -71,18 +68,13 @@ class Settings(BaseSettings):
     keepa_api_key: str = ""
     keepa_domain: int = 1
     keepa_cache_ttl_seconds: int = 86_400
-    keepa_min_request_interval_sec: float = 1.05
-    # Target Keepa API pacing (token bucket / min), shared by all concurrent jobs in this process.
-    keepa_target_tokens_per_minute: float = 60.0
-    # When the token bucket is enabled, skip extra per-call spacing (bucket already paces).
-    keepa_skip_min_interval_when_bucket: bool = True
     # Max parallel threads issuing Keepa calls inside one job (SKU/GTIN/domain batches).
-    keepa_parallel_max: int = 16
+    # High default: actual pacing is reactive (server-signal driven), not proactive.
+    keepa_parallel_max: int = 50
 
-    # Haiku ASIN validation RPM cap, shared by all concurrent jobs in this process.
-    haiku_rpm_per_minute: int = 50
-    haiku_validate_min_workers: int = 4
-    haiku_validate_max_workers: int = 24
+    # Max parallel Haiku ASIN-validation workers per job.  Anthropic 429 retry (12 attempts
+    # with backoff) handles rate limits reactively — no proactive RPM cap needed.
+    haiku_validate_max_workers: int = 50
 
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma3:27b"
@@ -93,8 +85,6 @@ class Settings(BaseSettings):
     # LLM ASIN vs listing check when request allows (Haiku if ANTHROPIC_API_KEY, else Ollama if reachable).
     use_ollama_asin_validate: bool = True
     ollama_asin_validate_timeout_sec: float = 120.0
-    # Space out Haiku ASIN checks (~50 RPM org limits). Set 0 to rely only on 429 retries in ollama_asin_validate.
-    anthropic_asin_validate_min_interval_sec: float = 1.25
     # When true with Ollama URL: also allow Ollama for SKU finder pick/escalation (Haiku used if ANTHROPIC_API_KEY set).
     use_ollama_resolver_gemma: bool = False
     # When true: allow Ollama for per-sheet Keepa domain (Haiku runs automatically when ANTHROPIC_API_KEY is set).
@@ -125,6 +115,7 @@ def get_cache() -> Cache:
 async def lifespan(app: FastAPI):
     get_cache()
     yield
+    close_pools()
     global _cache
     if _cache is not None:
         _cache.close()
@@ -496,15 +487,7 @@ def run_process_pipeline(
     )
 
     cache = get_cache()
-    keepa_bucket: Optional[TokenBucketLimiter] = None
-    if float(settings.keepa_target_tokens_per_minute) > 0:
-        keepa_bucket = get_shared_keepa_token_bucket(
-            float(settings.keepa_target_tokens_per_minute)
-        )
-    _k_interval = float(settings.keepa_min_request_interval_sec)
-    if keepa_bucket is not None and settings.keepa_skip_min_interval_when_bucket:
-        _k_interval = 0.0
-    throttle = KeepaThrottle(_k_interval, token_bucket=keepa_bucket)
+    throttle = KeepaThrottle(reactive_limiter=get_shared_keepa_reactive_limiter())
     kpx = max(1, int(settings.keepa_parallel_max))
 
     keepa_products: dict[tuple[int, str, str], dict[str, Any]] = {}
@@ -834,16 +817,10 @@ def run_process_pipeline(
             )
         else:
             label = "Haiku" if use_haiku_asin else "Ollama"
-            wmin = max(1, int(settings.haiku_validate_min_workers))
-            wmax = max(wmin, int(settings.haiku_validate_max_workers))
+            wmax = max(1, int(settings.haiku_validate_max_workers))
             if use_haiku_asin:
-                rpm_cap = max(1, int(settings.haiku_rpm_per_minute))
-                haiku_rpm = get_shared_haiku_asin_validate_rpm_limiter(rpm_cap)
-                n_workers = max(wmin, min(wmax, n_val, rpm_cap))
-                n_workers = min(n_workers, n_val)
+                n_workers = min(wmax, n_val)
             else:
-                rpm_cap = 0
-                haiku_rpm = RpmLimiter(requests_per_minute=500)
                 n_workers = 1
             tracker.configure_llm_pool(n_workers)
             val_counter = [0]
@@ -877,8 +854,6 @@ def run_process_pipeline(
                         if isinstance(v, str) and v.strip():
                             kb = v.strip()
                             break
-
-                    haiku_rpm.acquire()
 
                     if use_haiku_asin:
                         verdict, note = haiku_validate_asin_vs_description(
@@ -957,10 +932,9 @@ def run_process_pipeline(
                     with reject_lock:
                         llm_rejected.append((line, row, asin_h, conf_h, log_h, reject_asin_h))
 
-            rpm_note = f", {rpm_cap} RPM cap" if use_haiku_asin else ""
             p(
                 "ollama_asin",
-                f"{label} validating {n_val} ASINs ({n_workers} workers{rpm_note})…",
+                f"{label} validating {n_val} ASINs ({n_workers} workers)…",
                 0,
                 n_val,
             )

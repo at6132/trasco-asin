@@ -317,6 +317,11 @@ function ProcessingDashboard(props: {
                     </>
                   ) : null}
                 </p>
+                <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
+                  Sum of Keepa&apos;s <code className="rounded bg-slate-900/80 px-1 text-zinc-400">tokensConsumed</code>{" "}
+                  per live response. One batch product call can charge many tokens; SKU finder runs several calls per
+                  SKU.
+                </p>
               </>
             ) : (
               <p className="text-zinc-500">Loading…</p>
@@ -376,9 +381,9 @@ function ProcessingDashboard(props: {
                 <span className="text-zinc-500"> active / pool cap</span>
               </p>
               <p className="text-[11px] leading-relaxed text-zinc-500">
-                Parallel GTIN, SKU finder, and multi-domain ASIN batches. Pool size is capped by{" "}
-                <code className="rounded bg-slate-900/80 px-1 text-zinc-400">KEEPA_PARALLEL_MAX</code>{" "}
-                (default 16); pacing targets ~60 Keepa tokens/min via a shared token bucket.
+                Parallel GTIN, SKU finder, and multi-domain ASIN batches. Workers burst as fast
+                as possible; pacing is reactive — workers pause only when Keepa reports low tokens
+                or returns HTTP 429.
               </p>
             </MetricCard>
             <MetricCard title="LLM workers (this job)" accent="violet">
@@ -389,11 +394,8 @@ function ProcessingDashboard(props: {
                 <span className="text-zinc-500"> active / pool cap</span>
               </p>
               <p className="text-[11px] leading-relaxed text-zinc-500">
-                Haiku ASIN validation uses a sliding-window RPM limiter (default{" "}
-                <code className="rounded bg-slate-900/80 px-1 text-zinc-400">HAIKU_RPM_PER_MINUTE=50</code>
-                ). Workers are sized to saturate that cap without overshooting (
-                <code className="rounded bg-slate-900/80 px-1 text-zinc-400">HAIKU_VALIDATE_MAX_WORKERS</code>
-                ).
+                Haiku ASIN validation workers fire as fast as possible. If Anthropic returns
+                HTTP 429, each request retries with exponential backoff (up to 12 attempts).
               </p>
             </MetricCard>
           </div>
@@ -516,14 +518,17 @@ function ServerQueueBanner(props: { stats: QueueStats | null; fetchError: boolea
       <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-t border-white/10 pt-2 text-[11px] text-zinc-400">
         <span>
           <span className="text-zinc-500">Keepa (server, rolling 60s):</span>{" "}
-          <span className="tabular-nums font-medium text-emerald-200/90">{k60}</span> tokens
-          {kCalls > 0 ? (
-            <span className="text-zinc-500">
-              {" "}
-              ({kCalls} live {kCalls !== 1 ? "calls" : "call"})
-            </span>
-          ) : null}
-          <span className="text-zinc-500"> ≈ tokens/min burn</span>
+          <span className="tabular-nums font-medium text-emerald-200/90">{k60}</span>{" "}
+          <span className="text-zinc-500">
+            billing tokens
+            {kCalls > 0 ? (
+              <>
+                {" "}
+                ({kCalls} live {kCalls !== 1 ? "calls" : "call"} — batches cost more than one)
+              </>
+            ) : null}
+            ; not the same as rows or SKUs finished
+          </span>
         </span>
         <span className="tabular-nums text-zinc-500">
           {kRefill !== null ? (
@@ -545,16 +550,13 @@ function ServerQueueBanner(props: { stats: QueueStats | null; fetchError: boolea
       <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
         {multi ? (
           <>
-            Multiple uploads run at the same time and{" "}
-            <strong className="font-medium text-amber-100/90">
-              share the same Keepa token budget and API limits
-            </strong>
-            , so each job may finish slower than when you are the only one running.
+            Multiple uploads share the same Keepa API key — workers from all jobs
+            burst together and pause together when the server signals low tokens.
           </>
         ) : (
           <>
-            Keepa limits tokens per minute; if this feels slow while you are testing, check that
-            only one browser tab is processing a file, or wait for other active jobs to finish.
+            Workers burst as fast as the Keepa API allows, pausing only when the server
+            reports low tokens or returns 429.
           </>
         )}
       </p>
