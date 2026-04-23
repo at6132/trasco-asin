@@ -39,6 +39,7 @@ class TokenBucketLimiter:
                     self._cond.wait(timeout=gap + 0.01)
                     continue
                 self._last = time.time()
+                self._cond.notify_all()
                 return
 
     def report_response(self, data: dict[str, Any]) -> None:
@@ -48,6 +49,7 @@ class TokenBucketLimiter:
             wait = min(float(refill_ms) / 1000.0 + 0.25, 90.0)
             with self._cond:
                 self._paused_until = time.time() + wait
+                self._cond.notify_all()
                 log.info(
                     "Keepa tokens near-zero (%s left, refill in %sms) — pausing %.1fs",
                     tokens,
@@ -80,6 +82,7 @@ class RpmLimiter:
                 ]
                 if len(self._timestamps) < self._rpm:
                     self._timestamps.append(now)
+                    self._cond.notify_all()
                     return
                 oldest = self._timestamps[0]
                 wait = oldest + 60.0 - now + 0.05

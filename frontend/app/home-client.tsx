@@ -38,6 +38,10 @@ type ProcessStatus = {
   anthropic_output_tokens?: number;
   anthropic_total_tokens?: number;
   anthropic_requests?: number;
+  pipeline_keepa_workers_active?: number;
+  pipeline_keepa_workers_cap?: number;
+  pipeline_llm_workers_active?: number;
+  pipeline_llm_workers_cap?: number;
   source_filename?: string | null;
   download_name?: string | null;
 };
@@ -198,6 +202,12 @@ function ProcessingDashboard(props: {
     queueStats.active > 1 &&
     !queueFetchError;
 
+  const kpA = Number(status.pipeline_keepa_workers_active) || 0;
+  const kpC = Number(status.pipeline_keepa_workers_cap) || 0;
+  const lpA = Number(status.pipeline_llm_workers_active) || 0;
+  const lpC = Number(status.pipeline_llm_workers_cap) || 0;
+  const showWorkerRow = kpC > 0 || lpC > 0 || kpA > 0 || lpA > 0;
+
   return (
     <section
       className="mt-8 overflow-hidden rounded-2xl border border-cyan-500/30 bg-gradient-to-b from-slate-900/90 via-slate-950/95 to-slate-950/90 shadow-[0_0_48px_-12px_rgba(0,212,255,0.35)] backdrop-blur-xl"
@@ -355,6 +365,39 @@ function ProcessingDashboard(props: {
             </MetricCard>
           ) : null}
         </div>
+
+        {showWorkerRow ? (
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <MetricCard title="Keepa workers (this job)" accent="emerald">
+              <p className="tabular-nums">
+                <span className="text-lg font-semibold text-emerald-100">{kpA}</span>
+                <span className="text-zinc-500"> / </span>
+                <span className="text-zinc-300">{kpC}</span>
+                <span className="text-zinc-500"> active / pool cap</span>
+              </p>
+              <p className="text-[11px] leading-relaxed text-zinc-500">
+                Parallel GTIN, SKU finder, and multi-domain ASIN batches. Pool size is capped by{" "}
+                <code className="rounded bg-slate-900/80 px-1 text-zinc-400">KEEPA_PARALLEL_MAX</code>{" "}
+                (default 16); pacing targets ~60 Keepa tokens/min via a shared token bucket.
+              </p>
+            </MetricCard>
+            <MetricCard title="LLM workers (this job)" accent="violet">
+              <p className="tabular-nums">
+                <span className="text-lg font-semibold text-violet-100">{lpA}</span>
+                <span className="text-zinc-500"> / </span>
+                <span className="text-zinc-300">{lpC}</span>
+                <span className="text-zinc-500"> active / pool cap</span>
+              </p>
+              <p className="text-[11px] leading-relaxed text-zinc-500">
+                Haiku ASIN validation uses a sliding-window RPM limiter (default{" "}
+                <code className="rounded bg-slate-900/80 px-1 text-zinc-400">HAIKU_RPM_PER_MINUTE=50</code>
+                ). Workers are sized to saturate that cap without overshooting (
+                <code className="rounded bg-slate-900/80 px-1 text-zinc-400">HAIKU_VALIDATE_MAX_WORKERS</code>
+                ).
+              </p>
+            </MetricCard>
+          </div>
+        ) : null}
 
         {multi ? (
           <p className="mt-4 rounded-lg border border-amber-400/20 bg-amber-950/20 px-3 py-2 text-[11px] leading-relaxed text-amber-100/90">

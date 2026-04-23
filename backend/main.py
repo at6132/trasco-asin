@@ -21,7 +21,12 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Callable, Optional
 
-from backend.rate_limiter import RpmLimiter
+from backend.pipeline_metrics import PipelineSlotTracker
+from backend.global_rate_gates import (
+    get_shared_haiku_asin_validate_rpm_limiter,
+    get_shared_keepa_token_bucket,
+)
+from backend.rate_limiter import RpmLimiter, TokenBucketLimiter
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +72,17 @@ class Settings(BaseSettings):
     keepa_domain: int = 1
     keepa_cache_ttl_seconds: int = 86_400
     keepa_min_request_interval_sec: float = 1.05
+    # Target Keepa API pacing (token bucket / min), shared by all concurrent jobs in this process.
+    keepa_target_tokens_per_minute: float = 60.0
+    # When the token bucket is enabled, skip extra per-call spacing (bucket already paces).
+    keepa_skip_min_interval_when_bucket: bool = True
+    # Max parallel threads issuing Keepa calls inside one job (SKU/GTIN/domain batches).
+    keepa_parallel_max: int = 16
+
+    # Haiku ASIN validation RPM cap, shared by all concurrent jobs in this process.
+    haiku_rpm_per_minute: int = 50
+    haiku_validate_min_workers: int = 4
+    haiku_validate_max_workers: int = 24
 
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma3:27b"
@@ -401,6 +417,7 @@ def run_process_pipeline(
     anthropic_usage: Optional[AnthropicUsageLedger] = None,
     ollama_usage: Optional[OllamaTokenLedger] = None,
     debug: bool = False,
+    worker_metrics: Optional[PipelineSlotTracker] = None,
 ) -> tuple[BytesIO, str, dict[str, Any]]:
     def p(phase: str, message: str, current: int = 0, total: int = 0) -> None:
         if progress:
@@ -409,6 +426,7 @@ def run_process_pipeline(
     t0 = time.perf_counter()
     ollama_ledger = ollama_usage if ollama_usage is not None else OllamaTokenLedger()
     anthropic_ledger = anthropic_usage if anthropic_usage is not None else AnthropicUsageLedger()
+    tracker = worker_metrics if worker_metrics is not None else PipelineSlotTracker()
 
     validate_queue: list[
         tuple[dict[str, Any], dict[str, Any], str, str, dict[str, Any], str, str]
@@ -455,7 +473,16 @@ def run_process_pipeline(
     )
 
     cache = get_cache()
-    throttle = KeepaThrottle(settings.keepa_min_request_interval_sec)
+    keepa_bucket: Optional[TokenBucketLimiter] = None
+    if float(settings.keepa_target_tokens_per_minute) > 0:
+        keepa_bucket = get_shared_keepa_token_bucket(
+            float(settings.keepa_target_tokens_per_minute)
+        )
+    _k_interval = float(settings.keepa_min_request_interval_sec)
+    if keepa_bucket is not None and settings.keepa_skip_min_interval_when_bucket:
+        _k_interval = 0.0
+    throttle = KeepaThrottle(_k_interval, token_bucket=keepa_bucket)
+    kpx = max(1, int(settings.keepa_parallel_max))
 
     keepa_products: dict[tuple[int, str, str], dict[str, Any]] = {}
     errors: dict[tuple[int, str, str], str] = {}
@@ -494,70 +521,116 @@ def run_process_pipeline(
     n_direct = len(unique_direct)
     done_direct = 0
 
-    for dom, asin_list in asin_direct_by_domain.items():
-        p(
-            "keepa_direct",
-            f"Keepa ASIN batch domain {dom} — {len(asin_list)} ASINs…",
-            done_direct + 1,
-            max(n_direct, 1),
-        )
-        try:
-            batch_result = fetch_keepa_products_batch(
-                settings.keepa_api_key,
-                asin_list,
-                dom,
-                cache=cache,
-                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
-                history=0,
-                throttle=throttle,
-            )
-            for asin_val in asin_list:
-                dk = (dom, "asin", asin_val)
-                prod = batch_result.get(asin_val.strip().upper())
-                if prod:
-                    keepa_products[dk] = prod
-                else:
-                    errors[dk] = "not_found"
-                done_direct += 1
-        except KeepaError as e:
-            for asin_val in asin_list:
-                dk = (dom, "asin", asin_val)
-                errors[dk] = str(e)
-                done_direct += 1
-        except Exception as e:
-            for asin_val in asin_list:
-                dk = (dom, "asin", asin_val)
-                errors[dk] = f"lookup_error:{e}"
-                done_direct += 1
+    def _asin_domain_job(dom: int, asin_list: list[str]) -> tuple[dict[tuple[int, str, str], dict[str, Any]], dict[tuple[int, str, str], str], int]:
+        local_p: dict[tuple[int, str, str], dict[str, Any]] = {}
+        local_e: dict[tuple[int, str, str], str] = {}
+        n_ok = 0
+        with tracker.keepa_slot():
+            try:
+                batch_result = fetch_keepa_products_batch(
+                    settings.keepa_api_key,
+                    asin_list,
+                    dom,
+                    cache=cache,
+                    cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                    history=0,
+                    throttle=throttle,
+                )
+                for asin_val in asin_list:
+                    dk2 = (dom, "asin", asin_val)
+                    prod = batch_result.get(asin_val.strip().upper())
+                    if prod:
+                        local_p[dk2] = prod
+                    else:
+                        local_e[dk2] = "not_found"
+                    n_ok += 1
+            except KeepaError as e:
+                for asin_val in asin_list:
+                    local_e[(dom, "asin", asin_val)] = str(e)
+                    n_ok += 1
+            except Exception as e:
+                for asin_val in asin_list:
+                    local_e[(dom, "asin", asin_val)] = f"lookup_error:{e}"
+                    n_ok += 1
+        return local_p, local_e, n_ok
 
-    for dk in code_direct:
-        dom, kind, val = dk
-        done_direct += 1
+    dom_items = list(asin_direct_by_domain.items())
+    if len(dom_items) <= 1:
+        for dom, asin_list in dom_items:
+            p(
+                "keepa_direct",
+                f"Keepa ASIN batch domain {dom} — {len(asin_list)} ASINs…",
+                done_direct + 1,
+                max(n_direct, 1),
+            )
+            lp, le, _ = _asin_domain_job(dom, asin_list)
+            keepa_products.update(lp)
+            errors.update(le)
+            done_direct += sum(1 for _ in asin_list)
+    else:
+        pool_n = min(kpx, len(dom_items))
+        tracker.configure_keepa_pool(pool_n)
         p(
             "keepa_direct",
-            f"Keepa (GTIN/EAN) domain {dom} — {done_direct} of {n_direct}…",
-            done_direct,
+            f"Keepa ASIN batches — {len(dom_items)} domains ({pool_n} workers)…",
+            1,
             max(n_direct, 1),
         )
-        try:
-            payload = fetch_keepa_product_by_code(
-                settings.keepa_api_key,
-                val,
-                dom,
-                cache=cache,
-                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
-                history=0,
-                throttle=throttle,
+        with ThreadPoolExecutor(max_workers=pool_n) as pool:
+            futs = {pool.submit(_asin_domain_job, dom, al): (dom, al) for dom, al in dom_items}
+            for fut in as_completed(futs):
+                lp, le, n_add = fut.result()
+                keepa_products.update(lp)
+                errors.update(le)
+                done_direct += n_add
+                p(
+                    "keepa_direct",
+                    f"Keepa ASIN batches — merged domain batch ({done_direct} of {n_direct})…",
+                    min(done_direct, n_direct),
+                    max(n_direct, 1),
+                )
+
+    if code_direct:
+        n_code = len(code_direct)
+        pool_c = min(kpx, max(1, n_code))
+        tracker.configure_keepa_pool(pool_c)
+        done_lock = threading.Lock()
+
+        def _one_code(dk: tuple[int, str, str]) -> None:
+            nonlocal done_direct
+            dom, _kind, val = dk
+            with tracker.keepa_slot():
+                try:
+                    payload = fetch_keepa_product_by_code(
+                        settings.keepa_api_key,
+                        val,
+                        dom,
+                        cache=cache,
+                        cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                        history=0,
+                        throttle=throttle,
+                    )
+                    prod = best_product_by_title(payload, title_hint_for_key.get(dk))
+                    if not prod:
+                        errors[dk] = "not_found"
+                    else:
+                        keepa_products[dk] = prod
+                except KeepaError as e:
+                    errors[dk] = str(e)
+                except Exception as e:
+                    errors[dk] = f"lookup_error:{e}"
+            with done_lock:
+                done_direct += 1
+                d = done_direct
+            p(
+                "keepa_direct",
+                f"Keepa (GTIN/EAN) domain {dom} — {d} of {n_direct}…",
+                min(d, n_direct),
+                max(n_direct, 1),
             )
-            prod = best_product_by_title(payload, title_hint_for_key.get(dk))
-            if not prod:
-                errors[dk] = "not_found"
-                continue
-            keepa_products[dk] = prod
-        except KeepaError as e:
-            errors[dk] = str(e)
-        except Exception as e:
-            errors[dk] = f"lookup_error:{e}"
+
+        with ThreadPoolExecutor(max_workers=pool_c) as pool:
+            list(pool.map(_one_code, code_direct))
 
     sku_keys: list[str] = []
     sku_row_for: dict[str, dict[str, Any]] = {}
@@ -574,39 +647,52 @@ def run_process_pipeline(
 
     sku_results: dict[str, tuple[Optional[dict[str, Any]], str]] = {}
     n_sku = len(sku_keys)
-    for i, sk in enumerate(sku_keys, start=1):
-        p(
-            "keepa_sku",
-            f"Keepa product finder (SKU/MPN) {i} of {n_sku}…",
-            i,
-            max(n_sku, 1),
-        )
-        row0 = sku_row_for.get(sk) or {}
-        row_dom = int(row0.get("_keepa_domain") or settings.keepa_domain)
-        try:
-            prod, reason = resolve_via_product_finder(
-                settings.keepa_api_key,
-                row_dom,
-                cache,
-                brand=row0.get("_sheet_brand"),
-                sku=row0.get("_sku"),
-                mpn=row0.get("_mpn"),
-                title_hint=row0.get("_sheet_title_text"),
-                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
-                throttle=throttle,
-                anthropic_api_key=settings.anthropic_api_key,
-                haiku_model=settings.haiku_model,
-                ollama_base_url=settings.ollama_base_url,
-                ollama_model=settings.ollama_model,
-                ollama_timeout_sec=float(settings.ollama_asin_validate_timeout_sec),
-                use_ollama_resolver_gemma=settings.use_ollama_resolver_gemma,
-                source_file_hint=str(row0.get("_source_file_hint") or "").strip() or None,
-                ollama_usage=ollama_ledger,
-                anthropic_usage=anthropic_ledger,
+    if n_sku:
+        pool_s = min(kpx, max(1, n_sku))
+        tracker.configure_keepa_pool(pool_s)
+        sku_lock = threading.Lock()
+
+        def _one_sku(sk: str) -> None:
+            row0 = sku_row_for.get(sk) or {}
+            row_dom = int(row0.get("_keepa_domain") or settings.keepa_domain)
+            with tracker.keepa_slot():
+                try:
+                    prod, reason = resolve_via_product_finder(
+                        settings.keepa_api_key,
+                        row_dom,
+                        cache,
+                        brand=row0.get("_sheet_brand"),
+                        sku=row0.get("_sku"),
+                        mpn=row0.get("_mpn"),
+                        title_hint=row0.get("_sheet_title_text"),
+                        cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                        throttle=throttle,
+                        anthropic_api_key=settings.anthropic_api_key,
+                        haiku_model=settings.haiku_model,
+                        ollama_base_url=settings.ollama_base_url,
+                        ollama_model=settings.ollama_model,
+                        ollama_timeout_sec=float(settings.ollama_asin_validate_timeout_sec),
+                        use_ollama_resolver_gemma=settings.use_ollama_resolver_gemma,
+                        source_file_hint=str(row0.get("_source_file_hint") or "").strip() or None,
+                        ollama_usage=ollama_ledger,
+                        anthropic_usage=anthropic_ledger,
+                    )
+                    with sku_lock:
+                        sku_results[sk] = (prod, reason)
+                except Exception as e:
+                    with sku_lock:
+                        sku_results[sk] = (None, str(e))
+            with sku_lock:
+                done_i = len(sku_results)
+            p(
+                "keepa_sku",
+                f"Keepa product finder (SKU/MPN) {done_i} of {n_sku}…",
+                done_i,
+                max(n_sku, 1),
             )
-            sku_results[sk] = (prod, reason)
-        except Exception as e:
-            sku_results[sk] = (None, str(e))
+
+        with ThreadPoolExecutor(max_workers=pool_s) as pool:
+            list(pool.map(_one_sku, sku_keys))
 
     _DEBUG_HEADERS = [
         "dbg_parsed_asin",
@@ -702,9 +788,18 @@ def run_process_pipeline(
             )
         else:
             label = "Haiku" if use_haiku_asin else "Ollama"
-            haiku_rpm = RpmLimiter(requests_per_minute=45)
-            val_counter = [0]
-            val_lock = threading.Lock()
+            wmin = max(1, int(settings.haiku_validate_min_workers))
+            wmax = max(wmin, int(settings.haiku_validate_max_workers))
+            if use_haiku_asin:
+                rpm_cap = max(1, int(settings.haiku_rpm_per_minute))
+                haiku_rpm = get_shared_haiku_asin_validate_rpm_limiter(rpm_cap)
+                n_workers = max(wmin, min(wmax, n_val, rpm_cap))
+                n_workers = min(n_workers, n_val)
+            else:
+                rpm_cap = 0
+                haiku_rpm = RpmLimiter(requests_per_minute=500)
+                n_workers = 1
+            tracker.configure_llm_pool(n_workers)
 
             def _validate_one(
                 idx: int,
@@ -716,87 +811,93 @@ def run_process_pipeline(
                 log_h: str,
                 reject_asin_h: str,
             ) -> None:
-                desc = str((row.get("_sheet_title_text") or "")).strip()
-                ra0 = str(line.get(asin_h) or "").strip()
-                if not ra0:
-                    return
-                sku_raw = row.get("_sku")
-                sku_s = (
-                    str(sku_raw).strip()
-                    if sku_raw is not None and str(sku_raw).strip()
-                    else None
-                )
-                kt = prod.get("title") if isinstance(prod.get("title"), str) else None
-                kb = None
-                for k in ("brand", "manufacturer"):
-                    v = prod.get(k)
-                    if isinstance(v, str) and v.strip():
-                        kb = v.strip()
-                        break
+                with tracker.llm_slot():
+                    desc = str((row.get("_sheet_title_text") or "")).strip()
+                    ra0 = str(line.get(asin_h) or "").strip()
+                    if not ra0:
+                        return
+                    sku_raw = row.get("_sku")
+                    sku_s = (
+                        str(sku_raw).strip()
+                        if sku_raw is not None and str(sku_raw).strip()
+                        else None
+                    )
+                    kt = prod.get("title") if isinstance(prod.get("title"), str) else None
+                    kb = None
+                    for k in ("brand", "manufacturer"):
+                        v = prod.get(k)
+                        if isinstance(v, str) and v.strip():
+                            kb = v.strip()
+                            break
 
-                haiku_rpm.acquire()
+                    haiku_rpm.acquire()
 
-                if use_haiku_asin:
-                    verdict, note = haiku_validate_asin_vs_description(
-                        settings.anthropic_api_key.strip(),
-                        settings.haiku_model,
-                        sheet_description=desc,
-                        distributor_sku=sku_s,
-                        asin=ra0,
-                        amazon_title=kt,
-                        amazon_brand=kb,
-                        source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
-                        timeout=tmo,
-                        anthropic_usage=anthropic_ledger,
+                    if use_haiku_asin:
+                        verdict, note = haiku_validate_asin_vs_description(
+                            settings.anthropic_api_key.strip(),
+                            settings.haiku_model,
+                            sheet_description=desc,
+                            distributor_sku=sku_s,
+                            asin=ra0,
+                            amazon_title=kt,
+                            amazon_brand=kb,
+                            source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
+                            timeout=tmo,
+                            anthropic_usage=anthropic_ledger,
+                        )
+                    else:
+                        verdict, note = ollama_validate_asin_vs_description(
+                            settings.ollama_base_url,
+                            settings.ollama_model,
+                            sheet_description=desc,
+                            distributor_sku=sku_s,
+                            asin=ra0,
+                            amazon_title=kt,
+                            amazon_brand=kb,
+                            source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
+                            ollama_usage=ollama_ledger,
+                            timeout=tmo,
+                        )
+                    if debug:
+                        line["dbg_llm_pick_method"] = label
+                        line["dbg_llm_validate_verdict"] = verdict
+                        line["dbg_llm_validate_reason"] = _trace_snip(note or "", 500)
+                    if verdict == "reject":
+                        line[reject_asin_h] = ra0
+                        line[asin_h] = ""
+                        line[conf_h] = "NOT FOUND (LLM)"
+                        line[log_h] = _append_trace(
+                            str(line.get(log_h) or ""),
+                            f"llm_reject({label})={_trace_snip(note or '', 320)}",
+                        )
+                    elif verdict == "error":
+                        line[log_h] = _append_trace(
+                            str(line.get(log_h) or ""),
+                            f"llm_inconclusive({label})={_trace_snip(note or '', 320)}",
+                        )
+                        logger.debug(
+                            "%s ASIN validate inconclusive asin=%s note=%s",
+                            label,
+                            ra0,
+                            note,
+                        )
+                    with val_lock:
+                        val_counter[0] += 1
+                        done_n = val_counter[0]
+                    p(
+                        "ollama_asin",
+                        f"{label} validates ASIN vs listing ({done_n} of {n_val})…",
+                        done_n,
+                        n_val,
                     )
-                else:
-                    verdict, note = ollama_validate_asin_vs_description(
-                        settings.ollama_base_url,
-                        settings.ollama_model,
-                        sheet_description=desc,
-                        distributor_sku=sku_s,
-                        asin=ra0,
-                        amazon_title=kt,
-                        amazon_brand=kb,
-                        source_file_hint=str(row.get("_source_file_hint") or "").strip() or None,
-                        ollama_usage=ollama_ledger,
-                        timeout=tmo,
-                    )
-                if debug:
-                    line["dbg_llm_pick_method"] = label
-                    line["dbg_llm_validate_verdict"] = verdict
-                    line["dbg_llm_validate_reason"] = _trace_snip(note or "", 500)
-                if verdict == "reject":
-                    line[reject_asin_h] = ra0
-                    line[asin_h] = ""
-                    line[conf_h] = "NOT FOUND (LLM)"
-                    line[log_h] = _append_trace(
-                        str(line.get(log_h) or ""),
-                        f"llm_reject({label})={_trace_snip(note or '', 320)}",
-                    )
-                elif verdict == "error":
-                    line[log_h] = _append_trace(
-                        str(line.get(log_h) or ""),
-                        f"llm_inconclusive({label})={_trace_snip(note or '', 320)}",
-                    )
-                    logger.debug(
-                        "%s ASIN validate inconclusive asin=%s note=%s",
-                        label,
-                        ra0,
-                        note,
-                    )
-                with val_lock:
-                    val_counter[0] += 1
-                    done_n = val_counter[0]
-                p(
-                    "ollama_asin",
-                    f"{label} validates ASIN vs listing ({done_n} of {n_val})…",
-                    done_n,
-                    n_val,
-                )
 
-            n_workers = 4 if use_haiku_asin else 1
-            p("ollama_asin", f"{label} validating {n_val} ASINs ({n_workers} workers)…", 0, n_val)
+            rpm_note = f", {rpm_cap} RPM cap" if use_haiku_asin else ""
+            p(
+                "ollama_asin",
+                f"{label} validating {n_val} ASINs ({n_workers} workers{rpm_note})…",
+                0,
+                n_val,
+            )
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 futs = []
                 for i, (line, row, ah, ch, prod, lh, rh) in enumerate(validate_queue):
@@ -836,6 +937,10 @@ class ProcessJob:
     anthropic_output_tokens: int = 0
     anthropic_total_tokens: int = 0
     anthropic_requests: int = 0
+    pipeline_keepa_workers_active: int = 0
+    pipeline_keepa_workers_cap: int = 0
+    pipeline_llm_workers_active: int = 0
+    pipeline_llm_workers_cap: int = 0
     source_filename: Optional[str] = None
     started_at: float = field(default_factory=time.time)
     row_count: int = 0
@@ -905,6 +1010,10 @@ def _job_snapshot(job: ProcessJob) -> dict[str, Any]:
         snap["ollama_completion_tokens"] = job.ollama_completion_tokens
         snap["ollama_total_tokens"] = job.ollama_total_tokens
         snap["ollama_requests"] = job.ollama_requests
+        snap["pipeline_keepa_workers_active"] = job.pipeline_keepa_workers_active
+        snap["pipeline_keepa_workers_cap"] = job.pipeline_keepa_workers_cap
+        snap["pipeline_llm_workers_active"] = job.pipeline_llm_workers_active
+        snap["pipeline_llm_workers_cap"] = job.pipeline_llm_workers_cap
         if job.status == "complete":
             snap["duration_sec"] = job.duration_sec
             snap["source_filename"] = job.source_filename
@@ -927,10 +1036,12 @@ async def _run_process_job(
 
     ollama_ledger = OllamaTokenLedger()
     anthropic_ledger = AnthropicUsageLedger()
+    slot_tracker = PipelineSlotTracker()
 
     def progress(phase: str, message: str, current: int, total: int) -> None:
         au = anthropic_ledger.to_stats_dict()
         ou = ollama_ledger.to_stats_dict()
+        slots = slot_tracker.snapshot()
         with job.lock:
             job.status = "running"
             job.phase = phase
@@ -945,6 +1056,14 @@ async def _run_process_job(
             job.ollama_completion_tokens = int(ou.get("ollama_completion_tokens") or 0)
             job.ollama_total_tokens = int(ou.get("ollama_total_tokens") or 0)
             job.ollama_requests = int(ou.get("ollama_requests") or 0)
+            job.pipeline_keepa_workers_active = int(
+                slots.get("pipeline_keepa_workers_active") or 0
+            )
+            job.pipeline_keepa_workers_cap = int(slots.get("pipeline_keepa_workers_cap") or 0)
+            job.pipeline_llm_workers_active = int(
+                slots.get("pipeline_llm_workers_active") or 0
+            )
+            job.pipeline_llm_workers_cap = int(slots.get("pipeline_llm_workers_cap") or 0)
 
     def set_row_count(n: int) -> None:
         with job.lock:
@@ -963,6 +1082,7 @@ async def _run_process_job(
             anthropic_usage=anthropic_ledger,
             ollama_usage=ollama_ledger,
             debug=debug,
+            worker_metrics=slot_tracker,
         )
         xlsx_bytes = buf.getvalue()
         path = save_result_xlsx(job_id, xlsx_bytes)

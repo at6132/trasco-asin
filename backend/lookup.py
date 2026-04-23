@@ -149,14 +149,26 @@ def _keepa_get_json(
 
 
 class KeepaThrottle:
-    """Thread-safe spacing between live Keepa calls + token-aware backoff."""
+    """Thread-safe spacing between live Keepa calls + token-aware backoff.
 
-    def __init__(self, min_interval_sec: float = 1.05) -> None:
+    Optional ``token_bucket`` (e.g. ``TokenBucketLimiter``) enforces a target
+    requests-per-minute budget across parallel workers before the min-interval gate.
+    """
+
+    def __init__(
+        self,
+        min_interval_sec: float = 1.05,
+        *,
+        token_bucket: Optional[Any] = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._last = 0.0
         self.min_interval_sec = min_interval_sec
+        self._token_bucket = token_bucket
 
     def before_request(self) -> None:
+        if self._token_bucket is not None:
+            self._token_bucket.acquire()
         with self._lock:
             now = time.time()
             gap = self.min_interval_sec - (now - self._last)
@@ -165,6 +177,8 @@ class KeepaThrottle:
             self._last = time.time()
 
     def after_response(self, data: dict[str, Any]) -> None:
+        if self._token_bucket is not None:
+            self._token_bucket.report_response(data)
         tokens = data.get("tokensLeft")
         refill_ms = data.get("refillIn")
         if tokens is not None and tokens < 2 and refill_ms is not None:
