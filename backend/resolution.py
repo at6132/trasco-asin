@@ -78,9 +78,16 @@ def _title_selection(tq: str) -> dict[str, Any]:
     }
 
 
+def _sanitize_part_number(part: str) -> str:
+    """Keepa partNumber: strip dots that aren't part of a decimal, collapse whitespace."""
+    s = part.strip().lower()
+    s = s.strip(".")
+    return s[:120]
+
+
 def _part_selection(part: str, brand: Optional[str]) -> dict[str, Any]:
     sel: dict[str, Any] = {
-        "partNumber": part.strip().lower()[:120],
+        "partNumber": _sanitize_part_number(part),
         "perPage": 50,
         "sort": KEEPA_FINDER_SORT,
     }
@@ -101,6 +108,32 @@ def _dedupe_attempts(pairs: list[tuple[str, dict[str, Any]]]) -> list[tuple[str,
     return out
 
 
+_SKU_SUFFIX_RE = re.compile(
+    r"^(.+?)"
+    r"([A-Z]{1,3}\d{0,2}|B\d?|G|MC\w*|MW\w*|T\d?|E\d{0,4}|L\d{2,4}|P)$",
+    re.IGNORECASE,
+)
+
+
+def _sku_stem_variants(sku: str) -> list[str]:
+    """Generate progressively shorter SKU stems for fallback searches.
+
+    E.g. '0.6223.43G' -> ['0.6223.43', '0.6223']
+         '0.8170.20B1' -> ['0.8170.20', '0.8170']
+    """
+    variants: list[str] = []
+    cur = sku.strip()
+    for _ in range(3):
+        m = _SKU_SUFFIX_RE.match(cur)
+        if m and len(m.group(1)) >= 4:
+            cur = m.group(1).rstrip(".")
+            if cur.lower() != sku.strip().lower():
+                variants.append(cur)
+        else:
+            break
+    return variants
+
+
 def _build_standard_attempts(
     *,
     part: str,
@@ -118,6 +151,22 @@ def _build_standard_attempts(
         if brand and str(brand).strip():
             attempts.append(("finder_mpn_brand", _part_selection(mpn_norm, brand)))
         attempts.append(("finder_mpn", _part_selection(mpn_norm, None)))
+
+    if part and "." in part:
+        nodots = part.replace(".", " ").strip()
+        if nodots and nodots != part:
+            if brand and str(brand).strip():
+                attempts.append(("finder_part_nodots_brand", _part_selection(nodots, brand)))
+            attempts.append(("finder_part_nodots", _part_selection(nodots, None)))
+
+    stems = _sku_stem_variants(part or sku_k)
+    for i, stem in enumerate(stems):
+        normed = _norm_sku_key(stem)
+        if not normed:
+            continue
+        if brand and str(brand).strip():
+            attempts.append((f"finder_stem{i}_brand", _part_selection(normed, brand)))
+        attempts.append((f"finder_stem{i}", _part_selection(normed, None)))
 
     th = (title_hint or "").strip()
     if len(th) >= 3:

@@ -61,6 +61,44 @@ from backend.validator import (
     validate_title_match,
 )
 
+import re as _re
+
+_KNOWN_BRANDS = {
+    "3m", "adidas", "asus", "beko", "black+decker", "bosch", "braun", "brother",
+    "canon", "casio", "colgate", "cuisinart", "de'longhi", "delonghi", "dewalt",
+    "dyson", "electrolux", "emsa", "epson", "faber-castell", "fissler",
+    "garmin", "gillette", "grohe", "grundig", "hama", "hasbro", "hp",
+    "jbl", "karcher", "kenwood", "kitchenaid", "krups", "lacoste", "lamy",
+    "lego", "lenovo", "leifheit", "lg", "liebherr", "logitech", "makita",
+    "melitta", "metabo", "miele", "moulinex", "nespresso", "nike",
+    "nivea", "nokia", "oral-b", "oral b", "osram", "panasonic", "pelikan",
+    "philips", "puma", "reebok", "remington", "rowenta", "samsung", "sanyo",
+    "sennheiser", "sharp", "siemens", "sony", "staedtler", "stihl",
+    "tefal", "tesa", "tommy hilfiger", "toshiba", "tupperware", "victorinox",
+    "villeroy & boch", "villeroy&boch", "weber", "wmf", "wusthof", "zwilling",
+    "swiss military", "henckels", "emerson", "samsonite", "leatherman",
+    "gerber", "buck", "benchmade", "spyderco", "kershaw",
+}
+
+_BRAND_WORD_RE = _re.compile(r"[A-Za-z][A-Za-z0-9&'+\-]{1,30}")
+
+
+def _infer_brand_from_context(
+    filename: Optional[str],
+    sheet_names: list[str],
+) -> Optional[str]:
+    """Best-effort brand extraction from filename and sheet names."""
+    sources = []
+    if filename:
+        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+        sources.append(stem)
+    sources.extend(sheet_names)
+    text = " ".join(sources).lower()
+    for brand in sorted(_KNOWN_BRANDS, key=len, reverse=True):
+        if brand in text:
+            return brand.title()
+    return None
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -469,6 +507,16 @@ def run_process_pipeline(
     _upload_stem = (filename or "upload.xlsx").rsplit(".", 1)[0].strip()[:240]
     for _r in rows_in:
         _r["_source_file_hint"] = _upload_stem
+
+    any_brand = any(r.get("_sheet_brand") for r in rows_in)
+    if not any_brand:
+        inferred = _infer_brand_from_context(filename, parsed.sheets_processed)
+        if inferred:
+            logger.info("No brand column detected — inferred brand '%s' from file/sheet context", inferred)
+            for _r in rows_in:
+                _r["_sheet_brand"] = inferred
+                _r["_brand_inferred"] = True
+
     p("parse", f"Parsed {len(rows_in)} row(s) (max {max_rows}).", 1, 1)
 
     domain_llm_enabled = bool(settings.use_ollama_sheet_domain or settings.anthropic_api_key.strip())
