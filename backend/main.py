@@ -457,6 +457,10 @@ ProgressCb = Optional[Callable[[str, str, int, int], None]]
 RowCountCb = Optional[Callable[[int], None]]
 
 
+class JobCancelled(Exception):
+    """Raised when a background process job is cancelled (cooperative)."""
+
+
 def run_process_pipeline(
     data: bytes,
     filename: str,
@@ -470,12 +474,20 @@ def run_process_pipeline(
     ollama_usage: Optional[OllamaTokenLedger] = None,
     debug: bool = False,
     worker_metrics: Optional[PipelineSlotTracker] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> tuple[BytesIO, str, dict[str, Any]]:
     def p(phase: str, message: str, current: int = 0, total: int = 0) -> None:
+        if should_cancel and should_cancel():
+            raise JobCancelled()
         if progress:
             progress(phase, message, current, total)
 
+    def _check_cancel() -> None:
+        if should_cancel and should_cancel():
+            raise JobCancelled()
+
     t0 = time.perf_counter()
+    _check_cancel()
     ollama_ledger = ollama_usage if ollama_usage is not None else OllamaTokenLedger()
     anthropic_ledger = anthropic_usage if anthropic_usage is not None else AnthropicUsageLedger()
     tracker = worker_metrics if worker_metrics is not None else PipelineSlotTracker()
@@ -634,6 +646,7 @@ def run_process_pipeline(
             futs = {pool.submit(_asin_domain_job, dom, al): (dom, al) for dom, al in dom_items}
             for fut in as_completed(futs):
                 lp, le, n_add = fut.result()
+                _check_cancel()
                 keepa_products.update(lp)
                 errors.update(le)
                 done_direct += n_add
@@ -695,6 +708,7 @@ def run_process_pipeline(
     sku_row_for: dict[str, dict[str, Any]] = {}
     seen_sku: set[str] = set()
     for row in rows_in:
+        _check_cancel()
         dkey = _direct_lookup_key(row)
         if dkey:
             dom = int(row.get("_keepa_domain") or settings.keepa_domain)
@@ -814,6 +828,7 @@ def run_process_pipeline(
         out_rows: list[dict[str, Any]] = []
         total_r = len(sheet_rows)
         for ri, row in enumerate(sheet_rows, start=1):
+            _check_cancel()
             if ri == 1 or ri == total_r or ri % 25 == 0:
                 p(
                     "assemble",
@@ -1100,7 +1115,7 @@ def run_process_pipeline(
 
 @dataclass
 class ProcessJob:
-    status: str = "queued"  # queued | running | complete | error
+    status: str = "queued"  # queued | running | complete | error | cancelled
     phase: str = "queued"
     message: str = ""
     current: int = 0
@@ -1126,6 +1141,7 @@ class ProcessJob:
     row_count: int = 0
     completed_at: Optional[float] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 _process_jobs: dict[str, ProcessJob] = {}
@@ -1158,6 +1174,7 @@ def _process_queue_stats() -> dict[str, Any]:
             complete += 1
         elif st == "error":
             error += 1
+        # cancelled: not active (completed)
     active = queued + running
     return {
         "jobs_in_memory": len(_process_jobs),
@@ -1214,6 +1231,15 @@ async def _run_process_job(
     if job is None:
         return
 
+    with job.lock:
+        if job.cancel_event.is_set():
+            job.status = "cancelled"
+            job.phase = "cancelled"
+            job.message = "Cancelled by user."
+            job.error = None
+            job.completed_at = time.time()
+            return
+
     ollama_ledger = OllamaTokenLedger()
     anthropic_ledger = AnthropicUsageLedger()
     slot_tracker = PipelineSlotTracker()
@@ -1263,6 +1289,7 @@ async def _run_process_job(
             ollama_usage=ollama_ledger,
             debug=debug,
             worker_metrics=slot_tracker,
+            should_cancel=job.cancel_event.is_set,
         )
         xlsx_bytes = buf.getvalue()
         path = save_result_xlsx(job_id, xlsx_bytes)
@@ -1302,6 +1329,13 @@ async def _run_process_job(
             job.anthropic_output_tokens = int(stats.get("anthropic_output_tokens") or 0)
             job.anthropic_total_tokens = int(stats.get("anthropic_total_tokens") or 0)
             job.anthropic_requests = int(stats.get("anthropic_requests") or 0)
+    except JobCancelled:
+        with job.lock:
+            job.status = "cancelled"
+            job.phase = "cancelled"
+            job.message = "Cancelled by user."
+            job.error = None
+            job.completed_at = time.time()
     except Exception as e:
         with job.lock:
             job.status = "error"
@@ -1309,6 +1343,23 @@ async def _run_process_job(
             job.message = str(e)
             job.error = str(e)
             job.completed_at = time.time()
+
+
+@app.post("/api/v1/process/cancel/{job_id}")
+def process_cancel(job_id: str) -> dict[str, str]:
+    """Request cooperative cancellation of a queued or running job."""
+    _purge_stale_jobs()
+    job = _process_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown job_id.")
+    with job.lock:
+        st = job.status
+    if st == "complete":
+        raise HTTPException(409, "Job already finished.")
+    if st in ("error", "cancelled"):
+        return {"ok": "true"}
+    job.cancel_event.set()
+    return {"ok": "true"}
 
 
 @app.post("/api/v1/process")
@@ -1500,6 +1551,7 @@ def root() -> dict[str, Any]:
         "parse": "POST /api/v1/parse",
         "process": "POST /api/v1/process",
         "process_start": "POST /api/v1/process/start",
+        "process_cancel": "POST /api/v1/process/cancel/{job_id}",
         "process_status": "GET /api/v1/process/status/{job_id}",
         "process_result": "GET /api/v1/process/result/{job_id}",
         "process_history": "GET /api/v1/process/history",

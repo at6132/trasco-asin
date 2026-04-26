@@ -211,8 +211,12 @@ function ProcessingDashboard(props: {
   status: ProcessStatus;
   queueStats: QueueStats | null;
   queueFetchError: boolean;
+  onRequestCancel: () => Promise<void>;
+  onCancelFailed: (message: string) => void;
 }) {
-  const { status, queueStats, queueFetchError } = props;
+  const { status, queueStats, queueFetchError, onRequestCancel, onCancelFailed } = props;
+  const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
+  const [cancelInFlight, setCancelInFlight] = useState(false);
   const indeterminate = status.total <= 0;
   const pct =
     status.total > 0
@@ -220,11 +224,16 @@ function ProcessingDashboard(props: {
       : 0;
   const activeIdx = phaseIndex(status.phase);
   const isDone = status.phase === "done";
-  const phaseLabel = phaseUserLabel(status.phase);
+  const isCancelled = status.status === "cancelled" || status.phase === "cancelled";
+  const canCancel = !isDone && !isCancelled && status.status !== "error" && status.status !== "complete";
+  const phaseLabel = phaseUserLabel(status.phase, isCancelled);
   const serverElapsed = Number(status.elapsed_sec) || 0;
   const rowCount = Number(status.row_count) || 0;
   const shouldTickEta =
-    !isDone && status.phase !== "error" && status.status !== "complete";
+    !isDone &&
+    !isCancelled &&
+    status.phase !== "error" &&
+    status.status !== "complete";
   const liveElapsed = useLiveElapsed(serverElapsed, shouldTickEta);
   const remainingSec = !isDone
     ? estimateRemainingSeconds(
@@ -284,10 +293,12 @@ function ProcessingDashboard(props: {
 
   return (
     <section
-      className="mt-8 overflow-hidden rounded-2xl border border-cyan-500/30 bg-gradient-to-b from-slate-900/90 via-slate-950/95 to-slate-950/90 shadow-[0_0_48px_-12px_rgba(0,212,255,0.35)] backdrop-blur-xl"
+      className="relative mt-8 overflow-hidden rounded-2xl border border-cyan-500/30 bg-gradient-to-b from-slate-900/90 via-slate-950/95 to-slate-950/90 shadow-[0_0_48px_-12px_rgba(0,212,255,0.35)] backdrop-blur-xl"
       aria-label="Live run monitor"
       aria-live="polite"
-      aria-busy={status.status !== "complete" && status.status !== "error"}
+      aria-busy={
+        status.status !== "complete" && status.status !== "error" && !isCancelled
+      }
     >
       <div className="border-b border-white/10 bg-gradient-to-r from-cyan-500/10 via-transparent to-violet-500/10 px-4 py-3 md:px-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -304,12 +315,27 @@ function ProcessingDashboard(props: {
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2">
+            {canCancel ? (
+              <button
+                type="button"
+                onClick={() => setCancelConfirmOpen(true)}
+                className="rounded-lg border border-red-500/40 bg-red-950/40 px-2.5 py-1.5 text-[11px] font-medium text-red-200/90 transition hover:bg-red-950/60"
+              >
+                Cancel job
+              </button>
+            ) : null}
             {etaText ? (
               <span className="rounded-lg border border-white/10 bg-slate-900/80 px-2.5 py-1 text-[11px] tabular-nums text-zinc-400">
                 {etaText}
               </span>
             ) : null}
-            <span className="rounded-full border border-cyan-500/35 bg-cyan-500/15 px-3 py-1 text-xs font-medium text-cyan-100">
+            <span
+              className={`rounded-full border px-3 py-1 text-xs font-medium ${
+                isCancelled
+                  ? "border-zinc-500/35 bg-zinc-500/15 text-zinc-200"
+                  : "border-cyan-500/35 bg-cyan-500/15 text-cyan-100"
+              }`}
+            >
               {phaseLabel}
             </span>
             {displayElapsed > 0 ? (
@@ -519,6 +545,60 @@ function ProcessingDashboard(props: {
           ) : null}
         </div>
       </div>
+
+      {cancelConfirmOpen ? (
+        <div
+          className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl bg-slate-950/80 p-4 backdrop-blur-sm"
+          role="presentation"
+        >
+          <div
+            className="relative w-full max-w-sm overflow-hidden rounded-2xl border border-white/10 bg-slate-900/95 p-5 shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="cancel-confirm-title"
+          >
+            <h3 id="cancel-confirm-title" className="text-base font-semibold text-white">
+              Cancel this job?
+            </h3>
+            <p className="mt-2 text-sm text-zinc-400">
+              The server will stop the pipeline on the next safe step. Partial work is not saved
+              to a download file.
+            </p>
+            <div className="mt-5 flex gap-2">
+              <button
+                type="button"
+                disabled={cancelInFlight}
+                onClick={() => setCancelConfirmOpen(false)}
+                className="flex-1 rounded-lg border border-white/15 bg-slate-800/80 py-2.5 text-sm font-medium text-zinc-200 transition hover:bg-slate-700/80 disabled:opacity-50"
+              >
+                Keep running
+              </button>
+              <button
+                type="button"
+                disabled={cancelInFlight}
+                onClick={() => {
+                  void (async () => {
+                    setCancelInFlight(true);
+                    try {
+                      await onRequestCancel();
+                      setCancelConfirmOpen(false);
+                    } catch (e) {
+                      onCancelFailed(
+                        e instanceof Error ? e.message : String(e),
+                      );
+                    } finally {
+                      setCancelInFlight(false);
+                    }
+                  })();
+                }}
+                className="flex-1 rounded-lg border border-red-500/50 bg-red-950/50 py-2.5 text-sm font-medium text-red-100 transition hover:bg-red-900/50 disabled:opacity-50"
+              >
+                {cancelInFlight ? "Cancelling…" : "Yes, cancel"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -606,9 +686,11 @@ const PHASE_USER: Record<string, string> = {
   workbook: "Building your file",
   done: "All set",
   queued: "Starting",
+  cancelled: "Cancelled",
 };
 
-function phaseUserLabel(phase: string): string {
+function phaseUserLabel(phase: string, isCancelled?: boolean): string {
+  if (isCancelled) return "Cancelled";
   return PHASE_USER[phase] ?? "Working\u2026";
 }
 
@@ -663,6 +745,7 @@ export default function HomeClient() {
   const [runConsoleKey, setRunConsoleKey] = useState(0);
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [queueFetchError, setQueueFetchError] = useState(false);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const cancelledRef = useRef(false);
 
   useEffect(() => {
@@ -719,8 +802,19 @@ export default function HomeClient() {
     };
   }, [busyProcess]);
 
+  const requestCancelJob = useCallback(async (jobId: string) => {
+    const r = await fetch(`${apiBase()}/api/v1/process/cancel/${jobId}`, {
+      method: "POST",
+    });
+    if (!r.ok) {
+      const t = (await r.text()) || r.statusText;
+      throw new Error(t);
+    }
+  }, []);
+
   const pollJob = useCallback(
     async (jobId: string, filenameFallback: string, isResume: boolean) => {
+      setActiveJobId(jobId);
       setBusy("process");
       if (!isResume) {
         setProcessProgress({
@@ -758,6 +852,10 @@ export default function HomeClient() {
             setError(s.error || s.message || "Process failed.");
             return;
           }
+          if (s.status === "cancelled") {
+            clearActiveJob();
+            return;
+          }
           if (s.status === "complete") {
             clearActiveJob();
             const { outName, summary } = buildSummary(s, filenameFallback);
@@ -777,6 +875,7 @@ export default function HomeClient() {
         clearActiveJob();
         setError(e instanceof Error ? e.message : String(e));
       } finally {
+        setActiveJobId(null);
         setBusy(null);
         setProcessProgress(null);
       }
@@ -807,6 +906,10 @@ export default function HomeClient() {
           return;
         }
         if (s.status === "error") {
+          clearActiveJob();
+          return;
+        }
+        if (s.status === "cancelled") {
           clearActiveJob();
           return;
         }
@@ -919,11 +1022,13 @@ export default function HomeClient() {
               onRun={onProcess}
             />
 
-            {busy === "process" && processProgress ? (
+            {busy === "process" && processProgress && activeJobId ? (
               <ProcessingDashboard
                 status={processProgress}
                 queueStats={queueStats}
                 queueFetchError={queueFetchError}
+                onRequestCancel={() => requestCancelJob(activeJobId)}
+                onCancelFailed={(msg) => setError(msg)}
               />
             ) : null}
 
