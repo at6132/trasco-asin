@@ -746,7 +746,10 @@ export default function HomeClient() {
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [queueFetchError, setQueueFetchError] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [userCancelledOk, setUserCancelledOk] = useState(false);
   const cancelledRef = useRef(false);
+  /** True after the user successfully requests cancel; poll loop stops and must not re-apply status. */
+  const abandonProcessPollRef = useRef(false);
 
   useEffect(() => {
     cancelledRef.current = false;
@@ -812,8 +815,28 @@ export default function HomeClient() {
     }
   }, []);
 
+  const onUserCancelJobConfirmed = useCallback(async () => {
+    if (!activeJobId) return;
+    const toCancel = activeJobId;
+    await requestCancelJob(toCancel);
+    setError(null);
+    abandonProcessPollRef.current = true;
+    clearActiveJob();
+    setBusy(null);
+    setProcessProgress(null);
+    setActiveJobId(null);
+    setUserCancelledOk(true);
+  }, [activeJobId, requestCancelJob]);
+
+  useEffect(() => {
+    if (!userCancelledOk) return;
+    const t = window.setTimeout(() => setUserCancelledOk(false), 5000);
+    return () => window.clearTimeout(t);
+  }, [userCancelledOk]);
+
   const pollJob = useCallback(
     async (jobId: string, filenameFallback: string, isResume: boolean) => {
+      abandonProcessPollRef.current = false;
       setActiveJobId(jobId);
       setBusy("process");
       if (!isResume) {
@@ -829,14 +852,19 @@ export default function HomeClient() {
       const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
       try {
         let firstPoll = true;
-        while (!cancelledRef.current) {
+        while (
+          !cancelledRef.current &&
+          !abandonProcessPollRef.current
+        ) {
           if (!firstPoll) await sleep(pollMs);
           firstPoll = false;
-          if (cancelledRef.current) break;
+          if (cancelledRef.current || abandonProcessPollRef.current) break;
           const sR = await fetch(
             `${apiBase()}/api/v1/process/status/${jobId}`,
           );
+          if (abandonProcessPollRef.current) break;
           if (!sR.ok) {
+            if (abandonProcessPollRef.current) break;
             clearActiveJob();
             if (sR.status === 404) {
               setError("Job expired. Please re-upload your file.");
@@ -846,6 +874,7 @@ export default function HomeClient() {
             return;
           }
           const s = (await sR.json()) as ProcessStatus;
+          if (abandonProcessPollRef.current) break;
           setProcessProgress(s);
           if (s.status === "error") {
             clearActiveJob();
@@ -872,8 +901,12 @@ export default function HomeClient() {
           }
         }
       } catch (e) {
-        clearActiveJob();
-        setError(e instanceof Error ? e.message : String(e));
+        if (abandonProcessPollRef.current) {
+          // User already dismissed the run; ignore network errors from trailing requests.
+        } else {
+          clearActiveJob();
+          setError(e instanceof Error ? e.message : String(e));
+        }
       } finally {
         setActiveJobId(null);
         setBusy(null);
@@ -924,6 +957,7 @@ export default function HomeClient() {
   const onProcess = useCallback(
     async (file: File | null, debug: boolean) => {
       setError(null);
+      setUserCancelledOk(false);
       if (!file) {
         setError("Choose an Excel or CSV file first.");
         return;
@@ -1027,11 +1061,20 @@ export default function HomeClient() {
                 status={processProgress}
                 queueStats={queueStats}
                 queueFetchError={queueFetchError}
-                onRequestCancel={() => requestCancelJob(activeJobId)}
+                onRequestCancel={onUserCancelJobConfirmed}
                 onCancelFailed={(msg) => setError(msg)}
               />
             ) : null}
 
+            {userCancelledOk ? (
+              <div
+                className="mt-6 rounded-2xl border border-zinc-500/30 bg-slate-900/80 px-4 py-3 text-sm text-zinc-200 backdrop-blur-sm"
+                role="status"
+                aria-live="polite"
+              >
+                Canceled. You can start a new run when you&rsquo;re ready.
+              </div>
+            ) : null}
             {error ? (
               <div
                 className="mt-6 rounded-2xl border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-100 backdrop-blur-sm"
