@@ -58,6 +58,11 @@ def _price_to_float(raw: int, currency: str) -> Optional[float]:
     return round(raw / 100.0, 2)
 
 
+def domain_currency(domain: int) -> str:
+    """Public alias for ``_domain_currency``: returns ISO-4217 code for a Keepa domain id."""
+    return _domain_currency(domain)
+
+
 def _domain_currency(domain: int) -> str:
     m = {
         1: "USD",

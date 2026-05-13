@@ -1,4 +1,21 @@
-"""After ASIN + confidence are final: fetch Keepa price history for HIGH/MEDIUM rows."""
+"""Fill the US price columns for HIGH/MEDIUM rows that survived US normalization.
+
+By the time this runs, ``backend.us_asin_normalize.normalize_sections_to_us_marketplace``
+has already converted every ASIN to an Amazon.com ASIN (or marked it
+``Not found (Foreign)``) and stashed the corresponding Keepa product on
+``line["__trasco_us_prod"]``. So this step is now small:
+
+  - For each HIGH/MEDIUM row with a stashed US prod:
+      * Average price (6 mo)        — Keepa NEW/Amazon csv lanes on .com
+      * Buy Box Price (incl. ship)  — Keepa ``csv[18]`` + buy-box fields on .com
+      * Monthly sales quantity      — Keepa ``monthlySold`` on .com
+      * Take home profit (USD)      — landed US Buy Box minus vendor cost
+      * ROI (%)                     — profit / cost
+
+Vendor cost is interpreted in the resolver marketplace's currency (Keepa domain id on
+``line["__trasco_domain"]``) and converted to USD via Frankfurter (free, ECB-sourced).
+The FX rate used is appended to the trace column for auditability.
+"""
 
 from __future__ import annotations
 
@@ -7,20 +24,33 @@ from typing import Any, Callable, Optional
 
 from backend.cache import Cache
 from backend.errors import JobCancelled
+from backend.fx import usd_per_currency
 from backend.keepa_price_history import (
     average_price_cell,
     buy_box_landed_money,
     buy_box_price_incl_shipping_cell,
+    domain_currency,
     monthly_sold_quantity_cell,
     parse_spreadsheet_unit_price,
 )
-from backend.lookup import KeepaThrottle, fetch_keepa_products_batch, is_keepa_style_asin
+from backend.lookup import KeepaThrottle, is_keepa_style_asin
 
 logger = logging.getLogger(__name__)
 
 ProgressCb = Optional[Callable[[str, str, int, int], None]]
 
-_CONF_FETCH = frozenset({"HIGH", "MEDIUM"})
+_CONF_FILL = frozenset({"HIGH", "MEDIUM"})
+
+# Output domain for all price columns. ASIN normalization has already enforced this.
+_OUTPUT_DOMAIN = 1
+
+
+def _append_trace(line: dict[str, Any], meta: dict[str, str], note: str) -> None:
+    log_h = meta.get("log_h")
+    if not log_h or not note:
+        return
+    prev = str(line.get(log_h) or "")
+    line[log_h] = (prev + ("|" if prev else "") + note).strip()
 
 
 def _apply_take_home_roi(
@@ -28,34 +58,76 @@ def _apply_take_home_roi(
     meta: dict[str, str],
     prod: dict[str, Any],
     *,
-    domain: int,
+    cache: Optional[Cache],
 ) -> None:
-    """``Take home profit`` = landed Buy Box minus mapped vendor **cost**; ``ROI`` = profit / cost."""
+    """``Take home profit`` = landed US Buy Box minus vendor cost (FX'd to USD)."""
     take_h = meta["take_home_h"]
     roi_h = meta["roi_h"]
     cost_col = (meta.get("cost_source_h") or "").strip()
-    landed = buy_box_landed_money(prod, domain=domain)
+    landed = buy_box_landed_money(prod, domain=_OUTPUT_DOMAIN)
     cost_val = parse_spreadsheet_unit_price(line.get(cost_col)) if cost_col else None
     if not landed or cost_val is None:
         line[take_h] = ""
         line[roi_h] = ""
         return
-    cur, land_amt = landed
-    profit = round(land_amt - cost_val, 2)
-    line[take_h] = f"{cur} {profit:.2f}"
-    if cost_val > 0:
-        line[roi_h] = f"{round((profit / cost_val) * 100, 2):.2f}%"
+
+    _bb_cur, land_amt_usd = landed
+    src_dom = int(line.get("__trasco_domain") or 1)
+    src_ccy = domain_currency(src_dom)
+
+    if src_ccy == "USD":
+        cost_usd: float = float(cost_val)
+    else:
+        rate = usd_per_currency(cache, src_ccy)
+        if rate is None or rate <= 0:
+            line[take_h] = ""
+            line[roi_h] = ""
+            _append_trace(line, meta, f"fx_unavailable={src_ccy}")
+            return
+        cost_usd = round(float(cost_val) * float(rate), 4)
+        _append_trace(line, meta, f"fx_{src_ccy.lower()}_usd={rate:.4f}")
+
+    profit_usd = round(land_amt_usd - cost_usd, 2)
+    line[take_h] = f"USD {profit_usd:.2f}"
+    if cost_usd > 0:
+        line[roi_h] = f"{round((profit_usd / cost_usd) * 100, 2):.2f}%"
     else:
         line[roi_h] = ""
 
 
-def _domain_asin_lists(buckets: dict[tuple[int, str], Any]) -> dict[int, list[str]]:
-    out: dict[int, list[str]] = {}
-    for dom, asin in buckets:
-        out.setdefault(dom, []).append(asin)
-    for dom in out:
-        out[dom] = sorted(set(out[dom]))
-    return out
+def _fill_us_price_columns(
+    line: dict[str, Any],
+    meta: dict[str, str],
+    prod: dict[str, Any],
+    *,
+    asin: str,
+    cache: Optional[Cache],
+    months: float,
+) -> None:
+    avg_h = meta["avg_price_h"]
+    bb_h = meta["buy_box_incl_ship_h"]
+    msq_h = meta["monthly_sales_qty_h"]
+    try:
+        line[avg_h] = average_price_cell(prod, domain=_OUTPUT_DOMAIN, months=months)
+    except Exception as e:
+        logger.warning("average price cell failed asin=%s: %s", asin, e)
+        line[avg_h] = f"error:{e}"
+    try:
+        line[bb_h] = buy_box_price_incl_shipping_cell(prod, domain=_OUTPUT_DOMAIN)
+    except Exception as e:
+        logger.warning("buy box price cell failed asin=%s: %s", asin, e)
+        line[bb_h] = f"error:{e}"
+    try:
+        line[msq_h] = monthly_sold_quantity_cell(prod)
+    except Exception as e:
+        logger.warning("monthly sales cell failed asin=%s: %s", asin, e)
+        line[msq_h] = f"error:{e}"
+    try:
+        _apply_take_home_roi(line, meta, prod, cache=cache)
+    except Exception as e:
+        logger.warning("take home / roi failed asin=%s: %s", asin, e)
+        line[meta["take_home_h"]] = f"error:{e}"
+        line[meta["roi_h"]] = f"error:{e}"
 
 
 def enrich_sections_price_history(
@@ -71,108 +143,48 @@ def enrich_sections_price_history(
     should_cancel: Optional[Callable[[], bool]],
     months: float = 6.0,
 ) -> None:
-    """Mutates row dicts: fills **Average price**, **Buy Box**, **Take home profit**, **ROI**, and **Monthly sales quantity** for HIGH/MEDIUM rows."""
-    _ = keepa_parallel_max
+    """Fill US price columns for HIGH/MEDIUM rows using the US Keepa product the
+    normalization step already cached on ``line["__trasco_us_prod"]``.
+    """
+    # Args kept for backward compatibility with the existing caller signature in
+    # ``main.py``. Network fetches happen during ``normalize_sections_to_us_marketplace``;
+    # this pass is now in-process only.
+    _ = api_key, cache_ttl_seconds, throttle, keepa_parallel_max, tracker
 
     def _check() -> None:
         if should_cancel and should_cancel():
             raise JobCancelled()
 
-    buckets: dict[tuple[int, str], list[tuple[dict[str, Any], dict[str, str], str, int]]] = {}
-    for sheet_title, _headers, out_rows, meta in sections:
+    rows_to_fill: list[tuple[dict[str, Any], dict[str, str], str, dict[str, Any]]] = []
+    for _sheet_title, _headers, out_rows, meta in sections:
         asin_h = meta["asin_h"]
         conf_h = meta["conf_h"]
-        for ri, line in enumerate(out_rows, start=1):
+        for line in out_rows:
             conf = str(line.get(conf_h) or "").strip().upper()
-            if conf not in _CONF_FETCH:
+            if conf not in _CONF_FILL:
                 continue
             asin = str(line.get(asin_h) or "").strip().upper()
             if not asin or not is_keepa_style_asin(asin):
                 continue
-            dom = int(line.get("__trasco_domain") or 1)
-            key = (dom, asin)
-            buckets.setdefault(key, []).append((line, meta, sheet_title, ri))
+            prod = line.get("__trasco_us_prod")
+            if not isinstance(prod, dict):
+                continue
+            rows_to_fill.append((line, meta, asin, prod))
 
-    if not buckets:
+    if not rows_to_fill:
         return
 
-    by_dom = _domain_asin_lists(buckets)
-    total_batches = sum((len(asins) + 99) // 100 for asins in by_dom.values())
-    n_asin = len(buckets)
+    total = len(rows_to_fill)
     if progress:
-        progress(
-            "keepa_price_hist",
-            f"Keepa 6m average price, buy box & monthly sales — {n_asin} unique ASIN(s)…",
-            0,
-            max(total_batches, 1),
-        )
+        progress("keepa_price_hist", f"Filling US price columns — {total} row(s)…", 0, total)
 
-    products_by_key: dict[tuple[int, str], dict[str, Any]] = {}
-    done_batches = 0
-    for dom, asin_list in sorted(by_dom.items()):
-        for i in range(0, len(asin_list), 100):
-            chunk = asin_list[i : i + 100]
-            _check()
-            with tracker.keepa_slot():
-                batch_map = fetch_keepa_products_batch(
-                    api_key,
-                    chunk,
-                    dom,
-                    cache=cache,
-                    cache_ttl_seconds=cache_ttl_seconds,
-                    history=1,
-                    buybox=1,
-                    throttle=throttle,
-                )
-            for a, prod in batch_map.items():
-                products_by_key[(dom, str(a).strip().upper())] = prod
-            done_batches += 1
-            if progress:
-                progress(
-                    "keepa_price_hist",
-                    f"Keepa 6m average price, buy box & monthly sales — batch {done_batches}/{max(total_batches, 1)}…",
-                    done_batches,
-                    max(total_batches, 1),
-                )
-
-    for key, lines in buckets.items():
-        dom, asin = key
-        prod = products_by_key.get(key)
-        if not prod:
-            for line, meta, _st, _ri in lines:
-                avg_h = meta["avg_price_h"]
-                bb_h = meta["buy_box_incl_ship_h"]
-                take_h = meta["take_home_h"]
-                roi_h = meta["roi_h"]
-                msq_h = meta["monthly_sales_qty_h"]
-                line[avg_h] = ""
-                line[bb_h] = ""
-                line[take_h] = ""
-                line[roi_h] = ""
-                line[msq_h] = ""
-            continue
-        for line, meta, _sheet_title, _ri in lines:
-            avg_h = meta["avg_price_h"]
-            bb_h = meta["buy_box_incl_ship_h"]
-            msq_h = meta["monthly_sales_qty_h"]
-            try:
-                line[avg_h] = average_price_cell(prod, domain=dom, months=months)
-            except Exception as e:
-                logger.warning("average price cell failed asin=%s: %s", asin, e)
-                line[avg_h] = f"error:{e}"
-            try:
-                line[bb_h] = buy_box_price_incl_shipping_cell(prod, domain=dom)
-            except Exception as e:
-                logger.warning("buy box price cell failed asin=%s: %s", asin, e)
-                line[bb_h] = f"error:{e}"
-            try:
-                line[msq_h] = monthly_sold_quantity_cell(prod)
-            except Exception as e:
-                logger.warning("monthly sales cell failed asin=%s: %s", asin, e)
-                line[msq_h] = f"error:{e}"
-            try:
-                _apply_take_home_roi(line, meta, prod, domain=dom)
-            except Exception as e:
-                logger.warning("take home / roi failed asin=%s: %s", asin, e)
-                line[meta["take_home_h"]] = f"error:{e}"
-                line[meta["roi_h"]] = f"error:{e}"
+    for idx, (line, meta, asin, prod) in enumerate(rows_to_fill, start=1):
+        _check()
+        _fill_us_price_columns(line, meta, prod, asin=asin, cache=cache, months=months)
+        if progress and (idx == total or idx % 25 == 0):
+            progress(
+                "keepa_price_hist",
+                f"Filling US price columns — {idx}/{total}…",
+                idx,
+                total,
+            )

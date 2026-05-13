@@ -27,6 +27,11 @@ from typing import Any, Callable, Optional
 from backend.errors import JobCancelled
 from backend.pipeline_metrics import PipelineSlotTracker
 from backend.price_history_enrich import enrich_sections_price_history
+from backend.us_asin_normalize import (
+    NOT_FOUND_FOREIGN_ASIN,
+    NOT_FOUND_FOREIGN_CONF,
+    normalize_sections_to_us_marketplace,
+)
 from backend.global_rate_gates import get_shared_keepa_reactive_limiter
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -127,6 +132,11 @@ class Settings(BaseSettings):
     # After resolution: fetch Keepa ``history=1`` for HIGH/MEDIUM rows (~6 months NEW/Amazon).
     keepa_price_history_enabled: bool = True
     keepa_price_history_months: float = 6.0
+
+    # After resolution, normalize every resolved ASIN to a US (Amazon.com) ASIN. ASINs
+    # that don't exist on .com (and whose UPC/EAN can't be cross-referenced) become
+    # ``Not found (Foreign)``. Disable only for debugging.
+    keepa_us_asin_normalize_enabled: bool = True
 
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma3:27b"
@@ -851,6 +861,8 @@ def run_process_pipeline(
             "take_home_h": take_home_h,
             "roi_h": roi_h,
             "monthly_sales_qty_h": monthly_sales_qty_h,
+            "log_h": log_h,
+            "reject_asin_h": reject_asin_h,
             "cost_source_h": cost_col,
         }
         out_rows: list[dict[str, Any]] = []
@@ -883,20 +895,64 @@ def run_process_pipeline(
             line[log_h] = trace
             line[reject_asin_h] = ""
             line["__trasco_domain"] = int(row.get("_keepa_domain") or settings.keepa_domain)
+            line["__trasco_gtin"] = (str(row.get("_gtin")).strip() if row.get("_gtin") else "")
+            # Stashed for the post-assemble US normalization + LLM validate steps.
+            line["__trasco_src_row"] = row
+            line["__trasco_resolver_prod"] = prod
             if debug:
                 for dh in _DEBUG_HEADERS:
                     line[dh] = dbg.get(dh, "")
             out_rows.append(line)
-            if (
-                do_llm_asin
-                and ra
-                and prod
-                and str((row.get("_sheet_title_text") or "")).strip()
-            ):
-                validate_queue.append(
-                    (line, row, asin_h, conf_h, prod, log_h, reject_asin_h)
-                )
         sections.append((sheet_name, headers, out_rows, meta))
+
+    # ─── US ASIN normalization ─────────────────────────────────────────────────────────
+    # Final ASIN resolution step: every resolved ASIN becomes either a verified US
+    # (Amazon.com) ASIN or ``Not found (Foreign)``. Runs BEFORE LLM validation /
+    # price enrichment so downstream stages see only US ASINs.
+    if settings.keepa_us_asin_normalize_enabled and settings.keepa_api_key.strip():
+        p("us_normalize", "Verifying resolved ASINs on Amazon.com…", 0, 0)
+        try:
+            normalize_sections_to_us_marketplace(
+                sections,
+                api_key=settings.keepa_api_key,
+                cache=cache,
+                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                throttle=throttle,
+                keepa_parallel_max=kpx,
+                tracker=tracker,
+                progress=p,
+                should_cancel=should_cancel,
+            )
+        except JobCancelled:
+            raise
+
+    # ─── Build LLM validate queue from post-normalization rows ────────────────────────
+    if do_llm_asin:
+        _SKIP_LLM_CONF = {"NOT FOUND", "NOT FOUND (LLM)", NOT_FOUND_FOREIGN_CONF.upper()}
+        for _sheet_name, _hdrs, out_rows, meta in sections:
+            asin_h_l = meta["asin_h"]
+            conf_h_l = meta["conf_h"]
+            log_h_l = meta["log_h"]
+            reject_asin_h_l = meta["reject_asin_h"]
+            for line in out_rows:
+                ra = str(line.get(asin_h_l) or "").strip()
+                conf = str(line.get(conf_h_l) or "").strip().upper()
+                if not ra or ra == NOT_FOUND_FOREIGN_ASIN or conf in _SKIP_LLM_CONF:
+                    continue
+                src_row = line.get("__trasco_src_row")
+                if not isinstance(src_row, dict):
+                    continue
+                # Prefer the US Keepa product (post-normalization). Fall back to the
+                # resolver-marketplace product so legacy code paths still work when
+                # normalization is disabled.
+                prod_for_llm = line.get("__trasco_us_prod") or line.get("__trasco_resolver_prod")
+                if not isinstance(prod_for_llm, dict):
+                    continue
+                if not str((src_row.get("_sheet_title_text") or "")).strip():
+                    continue
+                validate_queue.append(
+                    (line, src_row, asin_h_l, conf_h_l, prod_for_llm, log_h_l, reject_asin_h_l)
+                )
 
     if validate_queue and do_llm_asin:
         n_val = len(validate_queue)
@@ -1135,6 +1191,25 @@ def run_process_pipeline(
 
                 with ThreadPoolExecutor(max_workers=retry_pool_n) as pool:
                     list(pool.map(_retry_one, retry_candidates))
+
+                # LLM retry uses the resolver's marketplace, so any newly-found ASIN
+                # might not be a US ASIN. Re-normalize so the invariant holds.
+                if settings.keepa_us_asin_normalize_enabled and settings.keepa_api_key.strip():
+                    p("us_normalize", "Re-verifying ASINs on Amazon.com after LLM retry…", 0, 0)
+                    try:
+                        normalize_sections_to_us_marketplace(
+                            sections,
+                            api_key=settings.keepa_api_key,
+                            cache=cache,
+                            cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                            throttle=throttle,
+                            keepa_parallel_max=kpx,
+                            tracker=tracker,
+                            progress=p,
+                            should_cancel=should_cancel,
+                        )
+                    except JobCancelled:
+                        raise
 
     if settings.keepa_price_history_enabled:
         p(

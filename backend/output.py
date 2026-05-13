@@ -119,6 +119,7 @@ def workbook_from_sheet_sections(
         "LOW": PatternFill("solid", fgColor="FFC7CE"),
         "NOT FOUND": PatternFill("solid", fgColor="D9D9D9"),
         "NOT FOUND (LLM)": PatternFill("solid", fgColor="D9D9D9"),
+        "NOT FOUND (Foreign)": PatternFill("solid", fgColor="D9D9D9"),
     }
     used_titles: set[str] = set()
 
