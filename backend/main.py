@@ -3,6 +3,9 @@ FastAPI entrypoint: health, parse preview, full process → Excel (ASIN / GTIN /
 
 Column / header mapping and downstream LLM steps prefer Claude Haiku when ANTHROPIC_API_KEY is set.
 Optional local Ollama is used only when Anthropic is not configured or a step falls back.
+HIGH/MEDIUM rows receive a second Keepa pass (``history=1``) for a rolling **average price**
+column (~6 months, NEW then Amazon) and **Monthly sales quantity** (Keepa ``monthlySold``)
+in the workbook.
 """
 
 from __future__ import annotations
@@ -21,7 +24,9 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Callable, Optional
 
+from backend.errors import JobCancelled
 from backend.pipeline_metrics import PipelineSlotTracker
+from backend.price_history_enrich import enrich_sections_price_history
 from backend.global_rate_gates import get_shared_keepa_reactive_limiter
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -51,7 +56,12 @@ from backend.ollama_asin_validate import (
 from backend.ollama_usage import OllamaTokenLedger
 from backend.output import passthrough_headers, workbook_from_sheet_sections
 from backend.parser import parse_uploaded_file
-from backend.process_history import append_manifest, history_result_path, list_history, save_result_xlsx
+from backend.process_history import (
+    append_manifest,
+    history_result_path,
+    list_history,
+    save_result_xlsx,
+)
 from backend.resolution import resolve_via_product_finder, sku_resolve_storage_key
 from backend.validator import (
     aggregate_confidence,
@@ -113,6 +123,10 @@ class Settings(BaseSettings):
     # Max parallel Haiku ASIN-validation workers per job.  Anthropic 429 retry (12 attempts
     # with backoff) handles rate limits reactively — no proactive RPM cap needed.
     haiku_validate_max_workers: int = 50
+
+    # After resolution: fetch Keepa ``history=1`` for HIGH/MEDIUM rows (~6 months NEW/Amazon).
+    keepa_price_history_enabled: bool = True
+    keepa_price_history_months: float = 6.0
 
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma3:27b"
@@ -455,10 +469,6 @@ ProgressCb = Optional[Callable[[str, str, int, int], None]]
 
 
 RowCountCb = Optional[Callable[[int], None]]
-
-
-class JobCancelled(Exception):
-    """Raised when a background process job is cancelled (cooperative)."""
 
 
 def run_process_pipeline(
@@ -807,7 +817,7 @@ def run_process_pipeline(
         "dbg_fallback_result",
     ]
 
-    sections: list[tuple[str, list[str], list[dict[str, Any]]]] = []
+    sections: list[tuple[str, list[str], list[dict[str, Any]], dict[str, str]]] = []
     grouped = _group_rows_by_sheet(rows_in)
     n_sheets = len(grouped) or 1
     for si, (sheet_name, sheet_rows) in enumerate(grouped.items(), start=1):
@@ -822,9 +832,27 @@ def run_process_pipeline(
             col_order = [
                 k for k in sheet_rows[0].keys() if isinstance(k, str) and not k.startswith("_")
             ]
-        headers, asin_h, conf_h, log_h, reject_asin_h = passthrough_headers(col_order)
+        headers, asin_h, conf_h, avg_price_h, buy_box_incl_ship_h, take_home_h, roi_h, monthly_sales_qty_h, log_h, reject_asin_h = (
+            passthrough_headers(col_order)
+        )
         if debug:
             headers = headers + _DEBUG_HEADERS
+        src_map = sheet_rows[0].get("_mapping")
+        cost_col = ""
+        if isinstance(src_map, dict):
+            raw_cost = src_map.get("cost")
+            if raw_cost is not None:
+                cost_col = str(raw_cost).strip()
+        meta = {
+            "asin_h": asin_h,
+            "conf_h": conf_h,
+            "avg_price_h": avg_price_h,
+            "buy_box_incl_ship_h": buy_box_incl_ship_h,
+            "take_home_h": take_home_h,
+            "roi_h": roi_h,
+            "monthly_sales_qty_h": monthly_sales_qty_h,
+            "cost_source_h": cost_col,
+        }
         out_rows: list[dict[str, Any]] = []
         total_r = len(sheet_rows)
         for ri, row in enumerate(sheet_rows, start=1):
@@ -847,8 +875,14 @@ def run_process_pipeline(
             line = {h: row.get(h) for h in col_order}
             line[asin_h] = ra
             line[conf_h] = conf
+            line[avg_price_h] = ""
+            line[buy_box_incl_ship_h] = ""
+            line[take_home_h] = ""
+            line[roi_h] = ""
+            line[monthly_sales_qty_h] = ""
             line[log_h] = trace
             line[reject_asin_h] = ""
+            line["__trasco_domain"] = int(row.get("_keepa_domain") or settings.keepa_domain)
             if debug:
                 for dh in _DEBUG_HEADERS:
                     line[dh] = dbg.get(dh, "")
@@ -862,7 +896,7 @@ def run_process_pipeline(
                 validate_queue.append(
                     (line, row, asin_h, conf_h, prod, log_h, reject_asin_h)
                 )
-        sections.append((sheet_name, headers, out_rows))
+        sections.append((sheet_name, headers, out_rows, meta))
 
     if validate_queue and do_llm_asin:
         n_val = len(validate_queue)
@@ -1101,6 +1135,29 @@ def run_process_pipeline(
 
                 with ThreadPoolExecutor(max_workers=retry_pool_n) as pool:
                     list(pool.map(_retry_one, retry_candidates))
+
+    if settings.keepa_price_history_enabled:
+        p(
+            "keepa_price_hist",
+            "Fetching 6-month average prices & monthly sales (HIGH/MEDIUM)…",
+            0,
+            0,
+        )
+        try:
+            enrich_sections_price_history(
+                sections,
+                api_key=settings.keepa_api_key,
+                cache=cache,
+                cache_ttl_seconds=settings.keepa_cache_ttl_seconds,
+                throttle=throttle,
+                keepa_parallel_max=kpx,
+                tracker=tracker,
+                progress=p,
+                should_cancel=should_cancel,
+                months=float(settings.keepa_price_history_months),
+            )
+        except JobCancelled:
+            raise
 
     p("workbook", "Writing Excel workbook…", 0, 0)
     buf = workbook_from_sheet_sections(sections)

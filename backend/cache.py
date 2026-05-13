@@ -117,6 +117,8 @@ class Cache:
 # Keepa-specific helpers (thin convenience on top of kv_cache)
 
 KEEPA_NAMESPACE = "keepa_product_v1"
+# Product JSON from Keepa with ``history=1`` (price CSV arrays) — separate from no-history cache.
+KEEPA_HISTORY_NAMESPACE = "keepa_product_hist_v1"
 
 
 def keepa_cache_key(domain: int, asin: str) -> tuple[str, str, str]:
@@ -139,6 +141,33 @@ def set_cached_keepa_product(
     ttl_seconds: int,
 ) -> None:
     ns, ka, kb = keepa_cache_key(domain, asin)
+    cache.set_json(ns, ka, kb, payload, ttl_seconds=ttl_seconds)
+
+
+def keepa_history_cache_key(domain: int, asin: str, *, buybox: int = 0) -> tuple[str, str, str]:
+    """``buybox`` distinguishes responses that include Buy Box fields + ``csv[18]``."""
+    bb = 1 if int(buybox or 0) else 0
+    return KEEPA_HISTORY_NAMESPACE, asin.upper().strip(), f"{int(domain)}_bb{bb}"
+
+
+def get_cached_keepa_product_history(
+    cache: Cache, domain: int, asin: str, *, buybox: int = 0
+) -> Optional[dict[str, Any]]:
+    ns, ka, kb = keepa_history_cache_key(domain, asin, buybox=buybox)
+    data = cache.get_json(ns, ka, kb)
+    return data if isinstance(data, dict) else None
+
+
+def set_cached_keepa_product_history(
+    cache: Cache,
+    domain: int,
+    asin: str,
+    payload: dict[str, Any],
+    ttl_seconds: int,
+    *,
+    buybox: int = 0,
+) -> None:
+    ns, ka, kb = keepa_history_cache_key(domain, asin, buybox=buybox)
     cache.set_json(ns, ka, kb, payload, ttl_seconds=ttl_seconds)
 
 

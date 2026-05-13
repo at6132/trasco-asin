@@ -51,7 +51,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
-SEMANTIC_FIELDS = ("asin", "ean", "upc", "mpn", "sku", "title", "description", "brand")
+SEMANTIC_FIELDS = ("asin", "ean", "upc", "mpn", "sku", "title", "description", "brand", "cost")
 
 HEADER_KEYWORDS = frozenset(
     (
@@ -220,6 +220,22 @@ def _heuristic_mapping(headers: list[str]) -> dict[str, Optional[str]]:
         ),
         "description": pick_exact_then_boundary("description", "product description", "desc"),
         "brand": pick_exact_then_boundary("brand", "manufacturer", "mfr name", "brand name"),
+        "cost": pick_exact_then_boundary(
+            "cost",
+            "unit cost",
+            "manufacturer cost",
+            "mfg cost",
+            "factory cost",
+            "purchase cost",
+            "purchase price",
+            "buy cost",
+            "dealer cost",
+            "wholesale",
+            "wholesale price",
+            "landed cost",
+            "net cost",
+            "your cost",
+        ),
     }
 
 
@@ -259,7 +275,7 @@ def _parse_json_object_from_model(content: str) -> dict[str, Any]:
     return {}
 
 
-def _matrix_preview_for_llm(rows: list[list[Any]], max_rows: int = 40, max_cols: int = 22) -> list[list[str]]:
+def _matrix_preview_for_llm(rows: list[list[Any]], max_rows: int = 40, max_cols: int = 28) -> list[list[str]]:
     out: list[list[str]] = []
     for r in rows[:max_rows]:
         row_out: list[str] = []
@@ -280,12 +296,27 @@ def _llm_prompt_block(
         "columns": {k: "string|null" for k in SEMANTIC_FIELDS},
     }
     prompt = (
-        "Spreadsheets are vendor price lists or offers. Row 1 is NOT always the table header — "
-        "there may be logos, titles, blank rows, or key/value metadata before the real column header row.\n"
-        "Given a preview grid (0-based rows), choose the ONE row that is the product table's COLUMN HEADERS "
-        "(short labels like SKU, EAN, Description, Brand, Price — not a data row, not a paragraph).\n"
-        "Then map headers to semantic keys. Values in 'columns' MUST be the EXACT header string from that row, "
-        "or null if the sheet truly has no such column. Amazon ASIN is rare; leave asin null unless an ASIN column exists.\n"
+        "Spreadsheets are vendor price lists or offers. Column headers are often opaque: internal codes, "
+        "abbreviations, non-English labels, or generic names like 'A', 'Col3' — infer meaning from BOTH the "
+        "header text AND sample data rows below the header.\n"
+        "Row 1 is NOT always the table header; there may be logos, titles, blank rows, or metadata before the "
+        "real product table header row.\n\n"
+        "Given the preview grid (0-based rows), choose the ONE row that is the product table's COLUMN HEADERS "
+        "(short labels — not a data row, not a paragraph of prose).\n\n"
+        "Then map that row's EXACT header strings into JSON 'columns' (use null only when no such column exists). "
+        "These mappings are critical for downstream automation — pay special attention to:\n"
+        "- **sku**: vendor / merchant / article / style / product line identifier (not the same as MPN unless "
+        "only one id column exists).\n"
+        "- **upc**: US-style 12-digit barcode column, or any column whose sample values look like UPC-A (often "
+        "12 digits, sometimes shown with leading zero to 13). If the sheet has one combined barcode column, "
+        "prefer **ean** for generic GTIN/EAN-13 and **upc** only when clearly US UPC; if unsure, map the barcode "
+        "column to **ean** and leave **upc** null unless a second distinct UPC column exists.\n"
+        "- **cost**: your purchase / factory / wholesale / net unit cost to you (NOT MSRP, list price, MAP, "
+        "Amazon retail, or sell price).\n"
+        "Also map when present: **asin**, **ean**, **mpn**, **title**, **description**, **brand**.\n"
+        "Amazon ASIN is rare on vendor lists; leave **asin** null unless a real ASIN column exists.\n\n"
+        "Values in 'columns' MUST be the EXACT header string from the chosen header row (character-for-character "
+        "as shown in the grid / headers list), or null.\n\n"
         f"Heuristic guess for header row (1-based index): {guessed_header_1based}\n"
         f"If that row looks correct, you may repeat it or correct it.\n"
         f"Headers from heuristic guess: {json.dumps(headers_if_guess)}\n"

@@ -6,7 +6,7 @@ Excel output: preserve source columns + appended ASIN, confidence, and optional 
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, Union
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
@@ -32,12 +32,16 @@ def _autosize_columns(ws: Any, col_count: int, max_width: int = 60) -> None:
         ws.column_dimensions[letter].width = best
 
 
-def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str, str, str]:
+def passthrough_headers(
+    col_order: list[str],
+) -> tuple[list[str], str, str, str, str, str, str, str, str, str]:
     """
     Original column order unchanged; return
-    (full_row_headers, asin_header, confidence_header, trace_header, rejected_asin_header).
-    If the sheet already uses those names, pick non-colliding append names.
-    ``rejected_asin_header`` is filled when LLM ASIN validation rejects (else empty).
+    (full_row_headers, asin_header, confidence_header, average_price_header,
+    buy_box_incl_shipping_header, take_home_profit_header, roi_header,
+    monthly_sales_quantity_header, trace_header, rejected_asin_header).
+    ``Take home profit`` and ``ROI`` use the mapped vendor **cost** column (see parser)
+    plus Keepa Buy Box landed price for HIGH/MEDIUM rows.
     """
     lower = {str(h).strip().lower() for h in col_order if h}
     asin_h = "ASIN"
@@ -46,6 +50,31 @@ def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str, str,
     conf_h = "confidence"
     if conf_h.lower() in lower:
         conf_h = "Trasco confidence"
+    avg_h = "Average price"
+    if avg_h.lower() in lower:
+        avg_h = "Trasco average price (6 mo)"
+    if avg_h.lower() in lower:
+        avg_h = "_trasco_avg_price_6m"
+    bb_h = "Buy Box Price (incl. shipping if FBM)"
+    if bb_h.lower() in lower:
+        bb_h = "Trasco buy box price (incl. shipping if FBM)"
+    if bb_h.lower() in lower:
+        bb_h = "_trasco_buy_box_incl_ship"
+    take_h = "Take home profit"
+    if take_h.lower() in lower:
+        take_h = "Trasco take home profit"
+    if take_h.lower() in lower:
+        take_h = "_trasco_take_home_profit"
+    roi_h = "ROI"
+    if roi_h.lower() in lower:
+        roi_h = "Trasco ROI"
+    if roi_h.lower() in lower:
+        roi_h = "_trasco_roi_pct"
+    msq_h = "Monthly sales quantity"
+    if msq_h.lower() in lower:
+        msq_h = "Trasco monthly sales quantity"
+    if msq_h.lower() in lower:
+        msq_h = "_trasco_monthly_sales_qty"
     log_h = "Trasco trace"
     if log_h.lower() in lower:
         log_h = "Trasco diagnostics"
@@ -56,15 +85,21 @@ def passthrough_headers(col_order: list[str]) -> tuple[list[str], str, str, str,
         rej_h = "Trasco rejected ASIN"
     if rej_h.lower() in lower:
         rej_h = "_trasco_llm_rejected_asin"
-    full = list(col_order) + [asin_h, conf_h, log_h, rej_h]
-    return full, asin_h, conf_h, log_h, rej_h
+    full = list(col_order) + [asin_h, conf_h, avg_h, bb_h, take_h, roi_h, msq_h, log_h, rej_h]
+    return full, asin_h, conf_h, avg_h, bb_h, take_h, roi_h, msq_h, log_h, rej_h
 
 
 def workbook_from_sheet_sections(
-    sections: list[tuple[str, list[str], list[Mapping[str, Any]]]],
+    sections: list[
+        Union[
+            tuple[str, list[str], list[Mapping[str, Any]]],
+            tuple[str, list[str], list[Mapping[str, Any]], Any],
+        ]
+    ],
 ) -> BytesIO:
     """
-    Each section: (worksheet_title, headers_in_order, row_dicts).
+    Each section: (worksheet_title, headers_in_order, row_dicts) or
+    (title, headers, rows, meta) — meta is ignored (used by the pipeline only).
     Row dicts must contain exactly the keys in headers_in_order.
     """
     wb = Workbook()
@@ -98,7 +133,11 @@ def workbook_from_sheet_sections(
         used_titles.add(t)
         return t
 
-    for idx, (title, headers, rows) in enumerate(sections):
+    for idx, entry in enumerate(sections):
+        if len(entry) == 4:
+            title, headers, rows, _meta = entry
+        else:
+            title, headers, rows = entry  # type: ignore[misc]
         safe_title = _unique_sheet_title(title)
         if idx == 0:
             ws = wb.active
@@ -143,6 +182,6 @@ def workbook_from_sheet_sections(
 def rows_to_workbook(rows: Sequence[Mapping[str, Any]]) -> BytesIO:
     """Backward-compatible single-sheet writer when rows already include final headers."""
     if not rows:
-        return workbook_from_sheet_sections([("results", [], [])])
+        return workbook_from_sheet_sections([("results", [], [], None)])
     headers = list(rows[0].keys())
-    return workbook_from_sheet_sections([("results", headers, list(rows))])
+    return workbook_from_sheet_sections([("results", headers, list(rows), None)])

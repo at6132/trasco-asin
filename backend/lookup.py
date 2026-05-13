@@ -26,8 +26,10 @@ if __package__:
         Cache,
         get_cached_keepa_by_code,
         get_cached_keepa_product,
+        get_cached_keepa_product_history,
         set_cached_keepa_by_code,
         set_cached_keepa_product,
+        set_cached_keepa_product_history,
     )
     from .keepa_telemetry import record_keepa_response
 else:
@@ -35,8 +37,10 @@ else:
         Cache,
         get_cached_keepa_by_code,
         get_cached_keepa_product,
+        get_cached_keepa_product_history,
         set_cached_keepa_by_code,
         set_cached_keepa_product,
+        set_cached_keepa_product_history,
     )
     from keepa_telemetry import record_keepa_response
 
@@ -206,6 +210,7 @@ def fetch_keepa_product(
     *,
     stats_days: int = 90,
     history: int = 0,
+    buybox: int = 0,
     cache: Optional[Cache] = None,
     cache_ttl_seconds: int = 86_400,
     timeout: float = 60.0,
@@ -217,19 +222,26 @@ def fetch_keepa_product(
         raise KeepaError(f"Invalid ASIN format: {asin!r}")
 
     if cache:
-        hit = get_cached_keepa_product(cache, domain, asin)
-        if hit is not None:
-            return hit
+        if int(history or 0) > 0:
+            hit_h = get_cached_keepa_product_history(cache, domain, asin, buybox=int(buybox or 0))
+            if hit_h is not None:
+                return hit_h
+        else:
+            hit = get_cached_keepa_product(cache, domain, asin)
+            if hit is not None:
+                return hit
 
     if throttle:
         throttle.before_request()
-    params = {
+    params: dict[str, Any] = {
         "key": api_key,
         "domain": domain,
         "asin": asin,
         "stats": stats_days,
-        "history": history,
+        "history": int(history or 0),
     }
+    if int(buybox or 0):
+        params["buybox"] = 1
     data = _keepa_get_json(
         get_keepa_client(),
         KEEPA_PRODUCT_URL,
@@ -245,7 +257,17 @@ def fetch_keepa_product(
         throttle.after_response(data)
 
     if cache and isinstance(data, dict):
-        set_cached_keepa_product(cache, domain, asin, data, ttl_seconds=cache_ttl_seconds)
+        if int(history or 0) > 0:
+            set_cached_keepa_product_history(
+                cache,
+                domain,
+                asin,
+                data,
+                ttl_seconds=cache_ttl_seconds,
+                buybox=int(buybox or 0),
+            )
+        else:
+            set_cached_keepa_product(cache, domain, asin, data, ttl_seconds=cache_ttl_seconds)
 
     if log.isEnabledFor(logging.DEBUG):
         fp = first_product(data)
@@ -268,6 +290,7 @@ def fetch_keepa_products_batch(
     *,
     stats_days: int = 90,
     history: int = 0,
+    buybox: int = 0,
     cache: Optional[Cache] = None,
     cache_ttl_seconds: int = 86_400,
     timeout: float = 90.0,
@@ -283,9 +306,15 @@ def fetch_keepa_products_batch(
         return {}
     uncached: list[str] = []
     out: dict[str, dict[str, Any]] = {}
+    hist_on = int(history or 0) > 0
+    bb = int(buybox or 0)
     for a in clean:
         if cache:
-            hit = get_cached_keepa_product(cache, domain, a)
+            hit = (
+                get_cached_keepa_product_history(cache, domain, a, buybox=bb)
+                if hist_on
+                else get_cached_keepa_product(cache, domain, a)
+            )
             if hit is not None:
                 p = first_product(hit)
                 if p and p.get("asin"):
@@ -299,13 +328,15 @@ def fetch_keepa_products_batch(
         chunk = uncached[i : i + 100]
         if throttle:
             throttle.before_request()
-        params = {
+        params: dict[str, Any] = {
             "key": api_key,
             "domain": domain,
             "asin": ",".join(chunk),
             "stats": stats_days,
-            "history": history,
+            "history": int(history or 0),
         }
+        if bb:
+            params["buybox"] = 1
         data = _keepa_get_json(
             get_keepa_client(),
             KEEPA_PRODUCT_URL,
@@ -329,7 +360,18 @@ def fetch_keepa_products_batch(
                         "tokensLeft": data.get("tokensLeft"),
                         "refillIn": data.get("refillIn"),
                     }
-                    set_cached_keepa_product(cache, domain, str(p["asin"]), single, ttl_seconds=cache_ttl_seconds)
+                    asin_k = str(p["asin"])
+                    if hist_on:
+                        set_cached_keepa_product_history(
+                            cache,
+                            domain,
+                            asin_k,
+                            single,
+                            ttl_seconds=cache_ttl_seconds,
+                            buybox=bb,
+                        )
+                    else:
+                        set_cached_keepa_product(cache, domain, asin_k, single, ttl_seconds=cache_ttl_seconds)
         if log.isEnabledFor(logging.DEBUG):
             titles = [
                 (str(p.get("title") or "")[:60] if isinstance(p, dict) else "")

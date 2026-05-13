@@ -667,6 +667,7 @@ const PHASE_ORDER = [
   "keepa_sku",
   "assemble",
   "ollama_asin",
+  "keepa_price_hist",
   "workbook",
   "done",
 ] as const;
@@ -683,6 +684,7 @@ const PHASE_USER: Record<string, string> = {
   keepa_sku: "Finding matches",
   assemble: "Putting it together",
   ollama_asin: "Double-checking ASINs",
+  keepa_price_hist: "Average price & monthly sales (Keepa)",
   workbook: "Building your file",
   done: "All set",
   queued: "Starting",
@@ -1246,7 +1248,7 @@ function CompletionModal(props: {
       aria-modal="true"
       aria-labelledby="completion-title"
     >
-      <div className="trasco-modal-panel relative w-full max-w-md overflow-hidden rounded-3xl border border-cyan-500/30 bg-slate-950/90 p-8 shadow-[0_0_60px_-10px_rgba(0,212,255,0.4)]">
+      <div className="trasco-modal-panel relative max-h-[90vh] w-full max-w-lg overflow-y-auto overflow-x-hidden rounded-3xl border border-cyan-500/30 bg-slate-950/90 p-8 shadow-[0_0_60px_-10px_rgba(0,212,255,0.4)]">
         <div className="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-cyan-500/20 blur-3xl" />
         <h2
           id="completion-title"
@@ -1282,7 +1284,7 @@ function ComebackModal(props: {
   onDownload: () => void;
   onDismiss: () => void;
 }) {
-  const { summary, onDownload, onDismiss } = props;
+  const { summary, jobId, onDownload, onDismiss } = props;
   return (
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4 backdrop-blur-md"
@@ -1290,7 +1292,7 @@ function ComebackModal(props: {
       aria-modal="true"
       aria-labelledby="comeback-title"
     >
-      <div className="trasco-modal-panel relative w-full max-w-md overflow-hidden rounded-3xl border border-cyan-500/30 bg-slate-950/90 p-8 shadow-[0_0_60px_-10px_rgba(0,212,255,0.4)]">
+      <div className="trasco-modal-panel relative max-h-[90vh] w-full max-w-lg overflow-y-auto overflow-x-hidden rounded-3xl border border-cyan-500/30 bg-slate-950/90 p-8 shadow-[0_0_60px_-10px_rgba(0,212,255,0.4)]">
         <div className="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-cyan-500/20 blur-3xl" />
         <h2
           id="comeback-title"
