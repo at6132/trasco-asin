@@ -843,7 +843,7 @@ def run_process_pipeline(
                 k for k in sheet_rows[0].keys() if isinstance(k, str) and not k.startswith("_")
             ]
         headers, asin_h, conf_h, avg_price_h, buy_box_incl_ship_h, take_home_h, roi_h, monthly_sales_qty_h, log_h, reject_asin_h = (
-            passthrough_headers(col_order)
+            passthrough_headers(col_order, debug=debug)
         )
         if debug:
             headers = headers + _DEBUG_HEADERS

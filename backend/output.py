@@ -34,12 +34,19 @@ def _autosize_columns(ws: Any, col_count: int, max_width: int = 60) -> None:
 
 def passthrough_headers(
     col_order: list[str],
+    *,
+    debug: bool = False,
 ) -> tuple[list[str], str, str, str, str, str, str, str, str, str]:
     """
     Original column order unchanged; return
     (full_row_headers, asin_header, confidence_header, average_price_header,
     buy_box_incl_shipping_header, take_home_profit_header, roi_header,
     monthly_sales_quantity_header, trace_header, rejected_asin_header).
+
+    When ``debug`` is false, trace (and any ``dbg_*`` columns added by the pipeline)
+    are omitted from ``full_row_headers`` and monthly sales quantity is the last column.
+    Trace header names are still returned for internal pipeline bookkeeping.
+
     ``Take home profit`` and ``ROI`` use the mapped vendor **cost** column (see parser)
     plus Keepa Buy Box landed price for HIGH/MEDIUM rows.
     """
@@ -85,7 +92,11 @@ def passthrough_headers(
         rej_h = "Trasco rejected ASIN"
     if rej_h.lower() in lower:
         rej_h = "_trasco_llm_rejected_asin"
-    full = list(col_order) + [asin_h, conf_h, avg_h, bb_h, take_h, roi_h, msq_h, log_h, rej_h]
+    trasco = [asin_h, conf_h, avg_h, bb_h, take_h, roi_h]
+    if debug:
+        full = list(col_order) + trasco + [msq_h, log_h, rej_h]
+    else:
+        full = list(col_order) + trasco + [rej_h, msq_h]
     return full, asin_h, conf_h, avg_h, bb_h, take_h, roi_h, msq_h, log_h, rej_h
 
 
